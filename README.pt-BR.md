@@ -1,5 +1,10 @@
 # pinokiocontrol — instalador headless-first + CLI de controle para o Pinokio
 
+[![version](https://img.shields.io/badge/version-261121f--pub1-766b90)](https://github.com/iamnexa-us/pinokiocontrol)
+[![platform](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![GitHub repo](https://img.shields.io/badge/github-pinokiocontrol-181717?logo=github&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
+
 [English](README.md) | **Português**
 
 O Pinokio é um app maravilhoso — no desktop. Em **servidores e máquinas
