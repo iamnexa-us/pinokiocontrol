@@ -68,6 +68,11 @@
 #      isolamento (avisando). PINOKIO_INSTALLER_KNOWN_GOODS é validado antes
 #      de qualquer alteração. O pinokiocontrol --status sem root responde
 #      "n/d" em vez de "ativo: NÃO".
+#  13. (v.261126d — incidente de 2026-11-26 07:57) O lançamento direto leva o
+#      ambiente da área VNC (DISPLAY, DBUS, XDG_SESSION_TYPE) nas DUAS tentativas,
+#      isolada e sem isolamento, e só dá o lançamento por bom quando o processo
+#      do app segue vivo depois de uma trégua — um app que morre no arranque
+#      vive menos de 1 s e era confundido com sucesso.
 #
 # NOTA DE REDE (host-arsenal): SearXNG é SEMPRE acessado em :8888 (Home
 # Server do Pinokio). O instalador NUNCA reconfigura portas — só verifica.
@@ -95,7 +100,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="261126c-pub1"
+SCRIPT_VERSION="261126d-pub1"
 APP="pinokio"
 PKG="pinokio"
 UP_REPO="${PINOKIO_INSTALLER_REPO:-pinokiocomputer/pinokio}"
@@ -1285,12 +1290,27 @@ ensure_registered() {
 # Lançamento DIRETO (sem o vnccontrol): env de sessão + scope próprio. É o
 # caminho quando não há vnccontrol, quando --persistent é OFF, e a rede de
 # segurança quando o vnccontrol não sobe o app (ver cmd_start).
+launch_settled() {   # 0 = um processo do app surgiu E continua vivo depois da trégua; != 0 = não surgiu, morreu no arranque, ou a varredura falhou
+    local _ st
+    st=1
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        app_state; st=$?
+        [ "$st" = 2 ] && return 1     # varredura falhou: não dá para saber
+        [ "$st" = 0 ] && break
+        sleep 0.5
+    done
+    [ "$st" = 0 ] || return 1
+    # v.261126d: TRÉGUA. "Apareceu um processo" não é "o app subiu": um app que morre
+    # no arranque (ex.: sem DISPLAY) vive menos de 1 s — e era dado como sucesso.
+    sleep 2
+    app_state
+}
 direct_launch() {
     # v.261121f (R2): sem binário não há o que lançar — o & mascarava a
     # falha e o poll decidia sozinho (falso-ativo na porta default)
     [ -x "$OPT_PINOKIO/pinokio" ] \
         || die "pinokio não instalado em $OPT_PINOKIO — rode: pinokiocontrol --update"
-    local dbusa="" logf="$STATE_DIR/pinokio.log" waited=0 _ st
+    local dbusa="" logf="$STATE_DIR/pinokio.log"
     [ -s /var/lib/vnccontrol/vnc.dbus ] && dbusa="DBUS_SESSION_BUS_ADDRESS=$(cat /var/lib/vnccontrol/vnc.dbus 2>/dev/null)"
     mkdir -p "$STATE_DIR" 2>/dev/null || logf=/dev/null
     # teto do log do caminho direto (mesma regra do ring do vnccontrol: 1 MB,
@@ -1303,24 +1323,22 @@ direct_launch() {
         # vnccontrol. Se ele subiu outro session-app na mesma chamada, aquele
         # scope continua ocupado — e o systemd-run falharia com "Unit already
         # loaded", deixando o app fora do ar. Como vai em segundo plano, o
-        # erro não chega aqui: confere-se se o processo NOSSO apareceu.
-        setsid nohup systemd-run --quiet --scope --unit="${LAUNCH_UNIT}-d" --slice=system.slice -- \
+        # erro não chega aqui: confere-se se o processo NOSSO ficou de pé.
+        # v.261126d (incidente de 26/11 07:57, no 120Alien): o AMBIENTE da área
+        # VNC tem de ir nas DUAS tentativas. Na v.261126c só a segunda o levava:
+        # esta subia o app SEM DISPLAY, ele morria no arranque ("Missing X server
+        # or $DISPLAY") em ~0,5 s — e a varredura, que via o processo ainda vivo,
+        # dava o lançamento por bom. App fora do ar depois de um --restart, com o
+        # SearXNG :8888 junto. (A suíte não viu: o app falso não precisa de DISPLAY.)
+        env -u DBUS_SESSION_BUS_ADDRESS ${dbusa:+$dbusa} DISPLAY="$DISPLAY_VNC" XDG_SESSION_TYPE=x11 \
+            setsid nohup systemd-run --quiet --scope --unit="${LAUNCH_UNIT}-d" --slice=system.slice -- \
             "$OPT_PINOKIO/pinokio" --no-sandbox >>"$logf" 2>&1 8>&- 9>&- &
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            app_state; st=$?
-            [ "$st" = 0 ] && { waited=1; break; }
-            sleep 0.5
-        done
-        # última olhada LOGO antes de desistir: fecha a janela entre a checagem
-        # anterior e o lançamento sem isolamento (senão: uma 2ª instância).
-        if [ "$waited" != 1 ]; then app_state; [ $? = 0 ] && waited=1; fi
-        if [ "$waited" = 1 ]; then return 0; fi
-        # v.261126c (R2 rodada 2, N2): o systemd-run falhou DEPOIS da sonda.
-        # Sem esta segunda tentativa o app ficaria fora do ar.
+        if launch_settled; then return 0; fi
+        # v.261126c (R2 rodada 2, N2): o systemd-run falhou DEPOIS da sonda — ou o app
+        # morreu no arranque. Sem esta segunda tentativa o app ficaria fora do ar.
         say "aviso: o lançamento isolado (scope ${LAUNCH_UNIT}-d) não subiu o app — tentando SEM isolamento (o app fica no cgroup de quem chamou)"
     fi
-    env -u DBUS_SESSION_BUS_ADDRESS ${dbusa:+$dbusa} \
-        DISPLAY="$DISPLAY_VNC" XDG_SESSION_TYPE=x11 \
+    env -u DBUS_SESSION_BUS_ADDRESS ${dbusa:+$dbusa} DISPLAY="$DISPLAY_VNC" XDG_SESSION_TYPE=x11 \
         setsid nohup "$OPT_PINOKIO/pinokio" --no-sandbox >>"$logf" 2>&1 8>&- 9>&- &
 }
 cmd_start() {
