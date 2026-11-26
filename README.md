@@ -1,6 +1,6 @@
 # pinokiocontrol — headless-first installer & control CLI for Pinokio
 
-[![version](https://img.shields.io/badge/version-261126a--pub1-766b90)](https://github.com/iamnexa-us/pinokiocontrol)
+[![version](https://img.shields.io/badge/version-261126b--pub1-766b90)](https://github.com/iamnexa-us/pinokiocontrol)
 [![platform](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![GitHub repo](https://img.shields.io/badge/github-pinokiocontrol-181717?logo=github&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
@@ -33,9 +33,18 @@ curl -fsSL https://raw.githubusercontent.com/iamnexa-us/pinokiocontrol/main/inst
   same tag — as it did with 8.4.1 on 2026-11-25 — the installer re-evaluates
   it by itself instead of trusting a stale verdict.
 - **Restarts after an upgrade** — UPGRADE/REPAIR/REINSTALL swap the files on
-  disk, so the installer restarts the app when it was running (only the
-  processes of its own install are touched). No more "upgrade done" with the
-  old build still in the air.
+  disk, so the installer restarts the app when it was running. Expect about
+  one minute without the UI and without SearXNG. Only the processes whose
+  executable lives in `/opt/Pinokio` are touched; the relaunch runs in its
+  own systemd scope (never in the cgroup of whoever ran the installer); and
+  the verdict checks that the app — and the SearXNG that was up before —
+  actually came back. `PINOKIO_SKIP_AUTOSTART=1` skips the restart (the old
+  build keeps running; the installer says so).
+- **Never downgrades a healthy install** — when the latest release is
+  refused, the installer only moves to a known-good that is *newer* than
+  what is installed. A healthy install above the known-good stays where it
+  is. (Until v.261126a the one-liner silently downgraded it.) An explicit
+  `PINOKIO_INSTALLER_VERSION` can still roll back on purpose.
 - **Auto-updater neutralized by default** — updates happen only when YOU run
   them, through the gate. No more silent self-destruction at 3 a.m.
 - **Self-healing health checks** — binary, desktop entry, icons, permissions,
@@ -43,7 +52,9 @@ curl -fsSL https://raw.githubusercontent.com/iamnexa-us/pinokiocontrol/main/inst
   are always honest (`OK`, `OK with warnings`, or a clear failure — never a
   silent success).
 - **Idempotent under torture** — run it 10× just to see if it breaks: nothing
-  re-downloads, nothing breaks. A single-instance lock prevents concurrent runs.
+  re-downloads (at most once every 24 h when the GitHub API does not report
+  the asset digest), nothing breaks. A single-instance lock prevents
+  concurrent runs.
 - **Full terminal control** — no desktop required, ever.
 
 ## pinokiocontrol
@@ -70,7 +81,7 @@ never touches other session apps.
 | Already best & healthy | **SKIP** — audits, downloads nothing |
 | Critical file damage | **REINSTALL** same version (restarted if it was running) |
 | Installed binary incompatible (GLIBC) | **REPAIR** — auto-downgrade to known-good |
-| Latest incompatible | **PINNED** — keep known-good, explicit note |
+| Latest incompatible | **PINNED** — keeps the newest compatible version (never a silent downgrade), explicit note |
 | All candidates rejected, install healthy | **ADOPTION** — keep current, protect it |
 
 ## Variables (sandbox/testing)
@@ -79,7 +90,7 @@ never touches other session apps.
 `PINOKIO_INSTALLER_STATE_DIR`, `PINOKIO_INSTALLER_DL_DIR`,
 `PINOKIO_INSTALLER_VERSION` (exact pin), `PINOKIO_INSTALLER_KNOWN_GOODS`,
 `PINOKIO_ALLOW_AUTOUPDATE`, `PINOKIO_SKIP_AUTOSTART`, `PINOKIOCONTROL_BIN_DIR`,
-`PINOKIOCONTROL_LINK_DIR`, `PINOKIO_GATE_CACHE_TTL`, `GITHUB_TOKEN`.
+`PINOKIOCONTROL_LINK_DIR`, `PINOKIO_GATE_CACHE_TTL`, `PINOKIO_SEARX_WAIT`, `GITHUB_TOKEN`.
 
 ## License
 

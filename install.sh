@@ -9,7 +9,7 @@
 # Ou local:
 #   sudo bash install.sh
 #
-# O QUE FAZ (v.261121a):
+# O QUE FAZ (v.261121a; itens 3 e 10 revistos na v.261126a):
 #   1. Descobre a versão LATEST oficial no GitHub (pinokiocomputer/pinokio).
 #   2. Baixa o .deb OFICIAL da arquitetura da máquina (amd64 ou arm64).
 #   3. GATE GLIBC (novo; lição do 2026-11-21): o 8.4.0 upstream compilou o
@@ -46,10 +46,19 @@
 #   9. AUTO-VERIFICAÇÃO final com veredito claro (rc=0 OK / rc=1 RESSALVAS).
 #      Instância única garantida por flock (sem instalações concorrentes).
 #  10. REINÍCIO após troca de arquivos (v.261126a): UPGRADE/REPAIR/REINSTALL
-#      com o app em execução => "pinokiocontrol --restart" no fim. Antes o
-#      processo antigo seguia rodando o build antigo (pelos inodes antigos)
-#      até alguém reiniciar, com o veredito dizendo "UPGRADE concluído".
-#      Só processos do NOSSO /opt/Pinokio contam como "em execução".
+#      com o app em execução => "pinokiocontrol --restart" no fim — cerca de
+#      1 min sem a UI :42000 e sem o SearXNG :8888. Antes o processo antigo
+#      seguia rodando o build antigo (pelos inodes antigos) até alguém
+#      reiniciar, com o veredito dizendo "UPGRADE concluído".
+#      "Em execução" = processo cujo EXECUTÁVEL está em /opt/Pinokio (não por
+#      substring na linha de comando). O app relança num scope próprio da
+#      system.slice: nunca no cgroup de quem chamou (v.261126b).
+#      PINOKIO_SKIP_AUTOSTART=1 pula o reinício — o build antigo segue no ar
+#      até um "pinokiocontrol --restart" (o instalador avisa).
+#  11. Instalação SÃ nunca é rebaixada (v.261126b): com a latest recusada
+#      pelo gate, um candidato mais antigo que a versão instalada e saudável
+#      é ignorado (antes: "UPGRADE" que era um downgrade silencioso). Pin
+#      explícito (PINOKIO_INSTALLER_VERSION) continua podendo rebaixar.
 #
 # NOTA DE REDE (host-arsenal): SearXNG é SEMPRE acessado em :8888 (Home
 # Server do Pinokio). O instalador NUNCA reconfigura portas — só verifica.
@@ -71,11 +80,13 @@
 #   PINOKIO_GATE_CACHE_TTL         prazo (s) de um veredito "incompatível" em
 #                                  cache QUANDO a API não informa o digest do
 #                                  asset (default 86400 = 24h)
+#   PINOKIO_SEARX_WAIT             segundos de espera pelo SearXNG :8888 após
+#                                  um reinício (default 90)
 #   GITHUB_TOKEN                   opcional, alivia rate limit da API do GitHub
 
 set -euo pipefail
 
-SCRIPT_VERSION="261126a-pub1"
+SCRIPT_VERSION="261126b-pub1"
 APP="pinokio"
 PKG="pinokio"
 UP_REPO="${PINOKIO_INSTALLER_REPO:-pinokiocomputer/pinokio}"
@@ -100,6 +111,10 @@ GATE_CACHE="$STATE_DIR/glibc-gate.cache"
 # entra em jogo: asset diferente => reavalia, seja qual for a idade.
 GATE_CACHE_TTL="${PINOKIO_GATE_CACHE_TTL:-86400}"
 case "$GATE_CACHE_TTL" in ''|*[!0-9]*) GATE_CACHE_TTL=86400 ;; esac
+# v.261126b: quanto esperar o SearXNG (:8888) depois de um reinício, em
+# segundos (cada tentativa de leitura ainda tem 5 s de timeout próprio).
+SEARX_WAIT="${PINOKIO_SEARX_WAIT:-90}"
+case "$SEARX_WAIT" in ''|*[!0-9]*) SEARX_WAIT=90 ;; esac
 APP_DIR="$SYS_ROOT/opt/Pinokio"          # (= dirname de APP_BIN) dir do app
 
 # --- pinokiocontrol --------------------------------------------------------
@@ -372,6 +387,15 @@ critical_damage() {
     return 1
 }
 
+# SearXNG na :8888 (informativo — rede padrão; NUNCA reconfiguramos portas).
+# O estado ANTES da troca fica lembrado para o veredito saber se ele voltou.
+searx_code() {
+    local c
+    c=$(curl -m 5 -sS -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8888/search?q=x&format=json' 2>/dev/null) || c="000"
+    printf '%s' "${c:-000}"
+}
+SEARX_BEFORE="$(searx_code)"
+
 CURRENT_VER="$(installed_version)"
 if [ -n "$CURRENT_VER" ]; then
     info "Pinokio atualmente instalado: $CURRENT_VER"
@@ -423,7 +447,13 @@ resolve_version() {  # $1 = versão sem 'v'
     ASSET_NAME="$(asset_for_tag "$ver")"
     ASSET_URL="https://github.com/$UP_REPO/releases/download/v$ver/$ASSET_NAME"
     ASSET_SHA=""; ASSET_SIZE=""
-    warn "API do GitHub indisponível para v$ver (rate limit?); usando URL deduzida. sha256 não verificado neste modo."
+    # v.261126b (R1): distinguir "API fora" de "API respondeu, mas sem .deb
+    # para esta arquitetura" — o aviso antigo culpava o rate limit nos dois.
+    if [ -n "$json" ]; then
+        warn "a API do GitHub não listou o .deb ${DEB_ARCH} de v$ver; usando URL deduzida. sha256 não verificado neste modo."
+    else
+        warn "API do GitHub indisponível para v$ver (rate limit?); usando URL deduzida. sha256 não verificado neste modo."
+    fi
     return 0
 }
 
@@ -602,7 +632,7 @@ EOF
 # ---------------------------------------------------------------------------
 CAND_VER=""; DEB_FILE=""; SHA_UNVERIFIED=0
 select_candidate() {
-    local c rc
+    local c rc hint_incompat=0
     for c in $CANDIDATES; do
         [ -z "$c" ] && continue
         # candidato == instalado e instalado são => nada a baixar
@@ -614,6 +644,16 @@ select_candidate() {
             SHA_UNVERIFIED=0
             return 0
         fi
+        # v.261126b: instalação SÃ mais nova que o candidato FICA. Antes, com
+        # a latest recusada pelo gate, o laço caía no known-good e fazia
+        # "UPGRADE" de uma versão sã mais nova — um DOWNGRADE silencioso
+        # (ex.: 8.4.1 -> 8.3.7) em todo rerun do one-liner. Pin explícito
+        # (PINOKIO_INSTALLER_VERSION) continua podendo rebaixar: é o rollback.
+        if [ -z "${PINOKIO_INSTALLER_VERSION:-}" ] && [ "$RUNTIME_OK" = 1 ] && [ -n "$CURRENT_VER" ] \
+           && dpkg --compare-versions "$c" le "$CURRENT_VER" 2>/dev/null; then
+            skip "Candidato $c não é mais novo que a instalação sã ($CURRENT_VER) — mantida a instalada."
+            continue
+        fi
         # v.261126a: resolve PRIMEIRO — o sha256 que o GitHub publica é a
         # identidade do asset de HOJE. Só depois consulta o cache: um
         # "incompatível" só pula o download se for veredito DESSE asset (ou
@@ -623,7 +663,9 @@ select_candidate() {
             warn "Candidato $c: não resolvido no GitHub — pulando."
             continue
         fi
+        hint_incompat=0
         if gate_cache_lookup "$c" "$HOST_GLIBC" && [ -n "$CACHE_NEED" ] && ! glibc_ok "$CACHE_NEED"; then
+            hint_incompat=1
             if gate_cache_trusted "$c" "$HOST_GLIBC" "${ASSET_SHA:-}"; then
                 skip "Candidato $c: já recusado pelo gate (exige GLIBC $CACHE_NEED > $HOST_GLIBC; asset ${CACHE_SHA:0:12}, avaliado em $(gate_cache_date)) — pulando download."
                 continue
@@ -636,8 +678,16 @@ select_candidate() {
             return 0
         elif [ "$rc" = 2 ] || [ "$rc" = 3 ]; then
             continue   # gate reprovou (2) ou versão inexistente (3) — próximo
+        elif [ "$hint_incompat" = 1 ]; then
+            # v.261126b (R2): o cache já dizia "incompatível" (mesmo sem
+            # identidade) e a rede falhou nesta reavaliação — não derrubar
+            # uma máquina sã SEM veredito (ela perdia a auditoria e a
+            # neutralização do updater). Fica o veredito antigo por ora; a
+            # próxima execução com rede reavalia do mesmo jeito.
+            warn "Candidato $c: o cache diz incompatível (GLIBC $CACHE_NEED) e a reavaliação falhou agora (download rc=$rc) — mantido o veredito antigo; próxima execução com rede reavalia."
+            continue
         else
-            die "Falha real ao obter o candidato $c (curl rc=$rc, rede?). Abortando."
+            die "Falha real ao obter o candidato $c (fetch rc=$rc, rede?). Abortando."
         fi
     done
     return 1
@@ -670,6 +720,10 @@ if ! select_candidate; then
         LATEST_TAG="v$CAND_VER"
         ASSET_NAME="$(asset_for_tag "$CAND_VER")"
         DOWNGRADE_NOTE="nenhum candidato remoto compatível ($CANDIDATES) — instalação atual saudável adotada e protegida"
+        # v.261126b: NADA foi instalado nesta execução — o "sha não verificado"
+        # de um candidato que foi RECUSADO não é ressalva da instalação em pé
+        # (o atalho do candidato instalado-são já fazia o mesmo; aqui não).
+        SHA_UNVERIFIED=0
         warn "$DOWNGRADE_NOTE"
     else
         die "Nenhum candidato compatível ($CANDIDATES) e instalação atual ausente/quebrada. Nada feito."
@@ -733,6 +787,10 @@ fi
 # asset instalado.
 installed_asset_sha() {
     gate_cache_lookup "$CURRENT_VER" "$HOST_GLIBC" || return 0
+    # v.261126b (R1): só serve um veredito COMPATÍVEL. Entrada "incompatível"
+    # para esta versão fala de um asset que o gate RECUSOU — se a instalada
+    # roda sã aqui, é outro asset (ex.: .deb consertado instalado à mão).
+    [ -n "$CACHE_NEED" ] && glibc_ok "$CACHE_NEED" || return 0
     case "$CACHE_SHA" in ''|none) return 0 ;; esac
     printf '%s' "$CACHE_SHA"
 }
@@ -864,6 +922,7 @@ GATE_CACHE="$STATE_DIR/glibc-gate.cache"
 GATE_CACHE_TTL="${PINOKIO_GATE_CACHE_TTL:-86400}"
 case "$GATE_CACHE_TTL" in ''|*[!0-9]*) GATE_CACHE_TTL=86400 ;; esac
 case "$(uname -m)" in x86_64) DEB_ARCH=amd64 ;; aarch64|arm64) DEB_ARCH=arm64 ;; *) DEB_ARCH="" ;; esac
+KNOWN_GOODS="__KNOWN_GOODS__"   # fallbacks do instalador (substituído na instalação, como a versão)
 
 say() { echo "[pinokiocontrol] $*"; }
 die() { echo "[pinokiocontrol ERRO] $*" >&2; exit 1; }
@@ -877,8 +936,47 @@ session_apps_file() {
     if [ -n "$d" ] && [ -d "$d" ]; then printf '%s/vnc.session-apps' "$d"; else printf '/dev-work/.env/vnc.session-apps'; fi
 }
 
-pinokio_pids() { pgrep -f '[p]inokio-bin' 2>/dev/null || true; }
+# "Nosso" = processo cujo EXECUTÁVEL mora no diretório do app — lido do magic
+# link /proc/<pid>/exe (o sufixo " (deleted)" aparece quando o .deb foi
+# trocado em disco depois que o processo subiu). v.261126b (R2): antes era
+# substring na linha de comando (pgrep -f) — um tail/grep/watch que citasse
+# "pinokio-bin" contava como nosso e o --stop o MATAVA.
+app_dir_real() { realpath "${OPT_PINOKIO%/}" 2>/dev/null || printf '%s' "${OPT_PINOKIO%/}"; }
+pinokio_pids() {
+    local link exe want
+    [ -d "$OPT_PINOKIO" ] || return 0
+    want="$(app_dir_real)"
+    while read -r link exe; do
+        if [ -n "$exe" ]; then
+            exe="${exe% (deleted)}"
+            link="${link#/proc/}"
+            if [ "${exe%/*}" = "$want" ]; then printf '%s\n' "${link%/exe}"; fi
+        fi
+    done < <(find /proc/[0-9]*/exe -maxdepth 0 -printf '%p %l\n' 2>/dev/null)
+    return 0
+}
 is_running()   { [ -n "$(pinokio_pids)" ]; }
+
+# v.261126b (R2): o app relançado NÃO pode ficar no cgroup de quem chamou
+# (sessão SSH, serviço de agente…). O setsid tira da sessão, mas não do
+# cgroup: com KillMode=control-group, parar ou reiniciar a unidade de quem
+# chamou mata tudo que está lá — o Pinokio, o Caddy e o SearXNG iam junto e
+# ninguém os relançava. Com systemd + root o lançamento roda dentro de um
+# SCOPE próprio da system.slice; sem condições, lança como antes e avisa.
+launch_isolation_probe() {   # 0 = dá para isolar (a sonda some na hora)
+    command -v systemd-run >/dev/null 2>&1 || return 1
+    [ -d /run/systemd/system ] || return 1
+    [ "$(id -u)" = 0 ] || return 1
+    LAUNCH_UNIT="pinokio-live-$(date +%s)-$$"
+    systemd-run --quiet --scope --unit="pinokio-probe-$$" --slice=system.slice -- true 2>/dev/null
+}
+launch_isolated() {   # $@ = comando que sobe o app
+    if [ -n "${LAUNCH_ISOLATION:-}" ]; then
+        systemd-run --quiet --scope --unit="$LAUNCH_UNIT" --slice=system.slice -- "$@"
+    else
+        "$@"
+    fi
+}
 
 # v.261121d (R2): captura em variável — curl morto com -w já imprime "000" e
 # o "|| echo 000" encostava SEM newline => status exibia "000000".
@@ -1100,35 +1198,69 @@ ensure_registered() {
     return 0
 }
 
+# Lançamento DIRETO (sem o vnccontrol): env de sessão + scope próprio. É o
+# caminho quando não há vnccontrol, quando --persistent é OFF, e a rede de
+# segurança quando o vnccontrol não sobe o app (ver cmd_start).
+direct_launch() {
+    # v.261121f (R2): sem binário não há o que lançar — o & mascarava a
+    # falha e o poll decidia sozinho (falso-ativo na porta default)
+    [ -x "$OPT_PINOKIO/pinokio" ] \
+        || die "pinokio não instalado em $OPT_PINOKIO — rode: pinokiocontrol --update"
+    local dbusa="" logf="$STATE_DIR/pinokio.log"
+    [ -s /var/lib/vnccontrol/vnc.dbus ] && dbusa="DBUS_SESSION_BUS_ADDRESS=$(cat /var/lib/vnccontrol/vnc.dbus 2>/dev/null)"
+    mkdir -p "$STATE_DIR" 2>/dev/null || logf=/dev/null
+    local -a launch=("$OPT_PINOKIO/pinokio" --no-sandbox)
+    [ -z "${LAUNCH_ISOLATION:-}" ] || launch=(systemd-run --quiet --scope --unit="$LAUNCH_UNIT" --slice=system.slice -- "${launch[@]}")
+    env -u DBUS_SESSION_BUS_ADDRESS ${dbusa:+$dbusa} \
+        DISPLAY="$DISPLAY_VNC" XDG_SESSION_TYPE=x11 \
+        setsid nohup "${launch[@]}" >>"$logf" 2>&1 8>&- 9>&- &
+}
 cmd_start() {
     if is_running; then say "pinokio já está ativo"; return 0; fi
     vnc_area_up || die "área VNC ($DISPLAY_VNC) inativa — suba com: vnccontrol --on"
+    LAUNCH_ISOLATION=""; LAUNCH_UNIT=""; DIRECT_LAUNCH=0
+    if launch_isolation_probe; then
+        LAUNCH_ISOLATION=1
+    else
+        say "aviso: sem isolamento de cgroup (systemd-run indisponível) — o app fica no cgroup de quem chamou"
+    fi
     if ensure_registered && command -v vnccontrol >/dev/null 2>&1; then
         say "iniciando via 'vnccontrol --session-apps start' (idempotente; env+logs corretos)"
         # 8>&-: o vnccontrol lança ring-consumers eternos — sem isso o nosso
-        # flock (fd 8) vazava para eles e ficava preso para sempre
-        vnccontrol --session-apps start 8>&- || say "aviso: vnccontrol retornou erro"
+        # flock (fd 8) vazava para eles e ficava preso para sempre.
+        # timeout (v.261126b, R2): o vnccontrol espera o X e o painel sem
+        # limite próprio — o persist_autostart do instalador já usava 180 s.
+        launch_isolated timeout 150 vnccontrol --session-apps start 8>&- \
+            || say "aviso: vnccontrol retornou erro"
+        # v.261126b (achado no E2E, em produção): o vnccontrol decide "já
+        # ativo" por SUBSTRING na linha de comando ([p]inokio-bin) — qualquer
+        # processo que cite o nome (um shell de agente, um tail, um grep) e
+        # ele NÃO sobe o app, que ficaria fora do ar depois de um --restart.
+        # Espera o processo NOSSO aparecer (o wrapper é um sh antes do exec);
+        # se não vier em ~5 s, sobe direto.
+        local _ waited=0
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            is_running && { waited=1; break; }
+            sleep 0.5
+        done
+        if [ "$waited" != 1 ]; then
+            say "o vnccontrol não subiu o app (marcou 'já ativo' por outro processo?) — lançamento direto"
+            direct_launch
+            DIRECT_LAUNCH=1
+        fi
     else
         if [ "$(persistent_state)" = OFF ]; then
             say "persistent=OFF — lançamento direto SEM registrar no boot (lista intocada)"
         else
             say "vnccontrol ausente — lançamento direto"
         fi
-        # v.261121f (R2): sem binário não há o que lançar — o & mascarava a
-        # falha e o poll decidia sozinho (falso-ativo na porta default)
-        [ -x "$OPT_PINOKIO/pinokio" ] \
-            || die "pinokio não instalado em $OPT_PINOKIO — rode: pinokiocontrol --update"
-        local dbusa="" logf="$STATE_DIR/pinokio.log"
-        [ -s /var/lib/vnccontrol/vnc.dbus ] && dbusa="DBUS_SESSION_BUS_ADDRESS=$(cat /var/lib/vnccontrol/vnc.dbus 2>/dev/null)"
-        mkdir -p "$STATE_DIR" 2>/dev/null || logf=/dev/null
-        env -u DBUS_SESSION_BUS_ADDRESS ${dbusa:+$dbusa} \
-            DISPLAY="$DISPLAY_VNC" XDG_SESSION_TYPE=x11 \
-            setsid nohup "$OPT_PINOKIO/pinokio" --no-sandbox >>"$logf" 2>&1 8>&- 9>&- &
+        direct_launch
+        DIRECT_LAUNCH=1
     fi
     local p i loghint="/var/lib/vnccontrol/session-apps/pinokio.log"
     # v.261121f (R2): loghint também no branch OFF (o lançamento lá é direto;
     # o die apontava o log do vnccontrol que não foi usado)
-    if ! command -v vnccontrol >/dev/null 2>&1 || [ "$(persistent_state)" = OFF ]; then
+    if [ "${DIRECT_LAUNCH:-0}" = 1 ]; then
         loghint="$STATE_DIR/pinokio.log"
     fi
     p=$(pinokio_port)
@@ -1197,7 +1329,7 @@ cmd_persistent() {  # $1 = ON|OFF
 
 cmd_update() {
     [ "$(id -u)" -eq 0 ] || die "rode como root (sudo)"
-    local lv tag inst need=0 why="" unverified=0 pub_sha="" gate_note=""
+    local lv tag inst need=0 why="" unverified=0 pub_sha="" gate_note="" kg=""
     # v.261121e (R2): honrar PINOKIOCONTROL_SKIP_GITEA também no update
     if [ "${PINOKIOCONTROL_SKIP_GITEA:-0}" != 1 ]; then
         lv=$(curl -m 8 -fsSL "$GITEA_RAW/VERSION" 2>/dev/null || true)
@@ -1217,7 +1349,16 @@ cmd_update() {
             gate_cache_lookup "$tag" "$(host_glibc)"
             if [ -n "$CACHE_NEED" ] && ! glibc_ok "$CACHE_NEED"; then
                 if gate_cache_trusted "$tag" "$(host_glibc)" "$pub_sha"; then
-                    gate_note="latest $tag recusada pelo gate (exige GLIBC $CACHE_NEED > $(host_glibc); avaliado em $(gate_cache_date), asset ${CACHE_SHA:0:12}) — nada a fazer"
+                    # v.261126b (R1): "nada a fazer" só quando não há mesmo o que
+                    # fazer. Sem Pinokio, ou com um mais antigo que a known-good,
+                    # o instalador tem trabalho (INSTALL / UPGRADE p/ known-good)
+                    # — antes saía "já atualizado (… pinokio NENHUM)".
+                    kg="$(printf '%s\n' $KNOWN_GOODS | sort -V | tail -1)"
+                    if [ -z "$inst" ] || { [ -n "$kg" ] && dpkg --compare-versions "$inst" lt "$kg" 2>/dev/null; }; then
+                        need=1; why="${why:+$why; }pinokio ${inst:-nenhum}->$kg (known-good; latest $tag recusada pelo gate)"
+                    else
+                        gate_note="latest $tag recusada pelo gate (exige GLIBC $CACHE_NEED > $(host_glibc); avaliado em $(gate_cache_date), asset ${CACHE_SHA:0:12}) — nada a fazer"
+                    fi
                 else
                     need=1; why="${why:+$why; }pinokio ${inst:-nenhum}->$tag (cache do gate não identifica o asset publicado — reavaliando)"
                 fi
@@ -1329,7 +1470,13 @@ main "$@"
 PINOKIOCONTROL_EOF
     local rc=$?
     [ $rc -eq 0 ] || return $rc
-    sed -i "s/__SCRIPT_VERSION__/$SCRIPT_VERSION/g" "$PC_BIN_DIR/pinokiocontrol"
+    local kg_sed
+    kg_sed=$(printf '%s' "$KNOWN_GOODS" | sed -e 's/[&/\]/\\&/g')
+    sed -i -e "s/__SCRIPT_VERSION__/$SCRIPT_VERSION/g" -e "s/__KNOWN_GOODS__/$kg_sed/g" "$PC_BIN_DIR/pinokiocontrol"
+    # o placeholder tem mesmo sumir: um __KNOWN_GOODS__ literal deixaria o
+    # --update sem fallback e compararia versões contra lixo
+    grep -q '__[A-Z_]*__' "$PC_BIN_DIR/pinokiocontrol" 2>/dev/null \
+        && warn "placeholder não substituído no pinokiocontrol instalado ($PC_BIN_DIR/pinokiocontrol)." || true
     chmod 755 "$PC_BIN_DIR/pinokiocontrol"
     mkdir -p "$PC_LINK_DIR" 2>/dev/null || true
     ln -sf "$PC_BIN_DIR/pinokiocontrol" "$PC_LINK" 2>/dev/null \
@@ -1492,50 +1639,66 @@ vnc_area_up() {
     fi
 }
 
+# Dá para pôr processos num scope próprio da system.slice? (systemd + root; a
+# sonda cria e apaga um scope vazio na hora.) v.261126b (R2).
+systemd_scope_available() {
+    command -v systemd-run >/dev/null 2>&1 || return 1
+    [ -d /run/systemd/system ] || return 1
+    [ "$(id -u)" = 0 ] || return 1
+    systemd-run --quiet --scope --unit="pinokio-probe-$$" --slice=system.slice -- true 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # REINÍCIO após troca de arquivos (v.261126a). UPGRADE/REPAIR/REINSTALL
 # trocam os binários EM DISCO; o processo antigo seguia rodando o build
 # antigo pelos inodes antigos — e passava a ler recursos novos do disco —
 # até alguém reiniciar, com o veredito dizendo "UPGRADE concluído". Agora:
 # se o app estava em execução, ele volta NOVO no fim da instalação.
-# Só conta como "em execução" um pinokio-bin cujo executável vive no NOSSO
-# APP_DIR; um pinokio-bin de outro diretório não é nosso e não é tocado.
+# Só conta como "em execução" um processo cujo EXECUTÁVEL mora no NOSSO
+# APP_DIR (v.261126b, R2: antes era substring na linha de comando — um
+# tail/grep/watch que citasse "pinokio-bin" contava como "alheio" e
+# bloqueava o reinício, com rc=0 e "UPGRADE concluído").
 # ---------------------------------------------------------------------------
-managed_app_pids() {  # → MANAGED_PIDS (vazio = nenhum); rc=1 se houver pid ALHEIO
-    local p exe foreign=0
+app_dir_real() { realpath "${APP_DIR%/}" 2>/dev/null || printf '%s' "${APP_DIR%/}"; }
+managed_app_pids() {  # → MANAGED_PIDS: pids cujo executável vive em APP_DIR (vazio = nenhum)
+    local link exe want
     MANAGED_PIDS=""
-    for p in $(pgrep -f '[p]inokio-bin' 2>/dev/null); do
-        [ -d "/proc/$p" ] || continue           # morreu entre o pgrep e o readlink
-        exe=$(readlink "/proc/$p/exe" 2>/dev/null) || exe=""
-        case "${exe%/*}" in
-            "$APP_DIR") MANAGED_PIDS="$MANAGED_PIDS$p " ;;
-            *) foreign=1 ;;
-        esac
-    done
-    return "$foreign"
+    [ -d "$APP_DIR" ] || return 0
+    want="$(app_dir_real)"
+    while read -r link exe; do
+        if [ -n "$exe" ]; then
+            exe="${exe% (deleted)}"          # .deb trocado depois que o processo subiu
+            link="${link#/proc/}"
+            if [ "${exe%/*}" = "$want" ]; then MANAGED_PIDS="$MANAGED_PIDS${link%/exe} "; fi
+        fi
+    done < <(find /proc/[0-9]*/exe -maxdepth 0 -printf '%p %l\n' 2>/dev/null)
+    return 0
 }
 restart_app_after_swap() {
-    RESTART_STATUS="sem-troca"
+    RESTART_STATUS="sem-troca"; RESTART_FAIL=""
     case "${ACTION:-}" in UPGRADE|REPAIR|REINSTALL) ;; *) return 0 ;; esac
     if [ "$SKIP_AUTOSTART" = "1" ]; then
         RESTART_STATUS="pulado"
-        info "PINOKIO_SKIP_AUTOSTART=1 — um Pinokio em execução NÃO é reiniciado por este instalador (rode: pinokiocontrol --restart)."
+        managed_app_pids
+        if [ -n "$MANAGED_PIDS" ]; then
+            warn "PINOKIO_SKIP_AUTOSTART=1 — o Pinokio em execução (pids ${MANAGED_PIDS% }) NÃO foi reiniciado e segue no build antigo; rode: pinokiocontrol --restart"
+        else
+            info "PINOKIO_SKIP_AUTOSTART=1 — nenhum Pinokio em execução; nada a reiniciar."
+        fi
         return 0
     fi
-    if ! managed_app_pids; then
-        warn "há 'pinokio-bin' em execução FORA de $APP_DIR — não é nosso e não foi tocado. Para valer a versão instalada, reinicie com: pinokiocontrol --restart"
-        RESTART_STATUS="pulado-externo"
-        return 0
-    fi
+    managed_app_pids
     if [ -z "$MANAGED_PIDS" ]; then RESTART_STATUS="não-rodava"; return 0; fi
     if [ ! -x "$PC_BIN_DIR/pinokiocontrol" ]; then
-        warn "o Pinokio antigo (pids $MANAGED_PIDS) segue em execução: pinokiocontrol não foi instalado — reinicie manualmente."
         RESTART_STATUS="falhou"
+        RESTART_FAIL="o Pinokio antigo (pids ${MANAGED_PIDS% }) SEGUE no ar no build antigo: pinokiocontrol não foi instalado — reinicie manualmente (pare esses pids e suba com: vnccontrol --session-apps start)"
+        warn "$RESTART_FAIL."
         return 1
     fi
     if ! vnc_area_up; then
-        warn "o Pinokio antigo (pids $MANAGED_PIDS) segue em execução: a área VNC ($VNC_DISPLAY) está desligada e não há como relançá-lo. Suba a área e rode: pinokiocontrol --restart"
         RESTART_STATUS="falhou"
+        RESTART_FAIL="o Pinokio antigo (pids ${MANAGED_PIDS% }) SEGUE no ar no build antigo: a área VNC ($VNC_DISPLAY) está desligada e não há como relançá-lo — suba a área (vnccontrol --on) e rode: pinokiocontrol --restart"
+        warn "$RESTART_FAIL."
         return 1
     fi
     info "Reiniciando o Pinokio (pids ${MANAGED_PIDS% }) para valer a versão instalada ($(installed_version))..."
@@ -1550,13 +1713,19 @@ restart_app_after_swap() {
         healed "Pinokio reiniciado na versão instalada ($(installed_version))."
         RESTART_STATUS="reiniciado"
     else
-        warn "pinokiocontrol --restart retornou erro — o Pinokio pode estar fora do ar (veja as linhas [pinokiocontrol] acima)."
         RESTART_STATUS="falhou"
+        if [ "$ACTION" = REPAIR ]; then
+            # o build anterior é o que o próprio REPAIR declarou quebrado: não adianta voltar a ele
+            RESTART_FAIL="o Pinokio não voltou após a troca de arquivos (o app não respondeu) — rode: pinokiocontrol --start e veja o log do app"
+        else
+            RESTART_FAIL="o Pinokio não voltou após a troca de arquivos (o app não respondeu) — rode: pinokiocontrol --start; se o build novo não subir, volte ao anterior com: PINOKIO_INSTALLER_VERSION=${CURRENT_VER:-<versão anterior>} + este instalador"
+        fi
+        warn "$RESTART_FAIL."
         return 1
     fi
     return 0
 }
-RESTART_STATUS="sem-troca"
+RESTART_STATUS="sem-troca"; RESTART_FAIL=""
 restart_app_after_swap || true
 
 persist_autostart() {
@@ -1618,7 +1787,17 @@ persist_autostart() {
         # fecha fd herdado do pinokiocontrol (--update). Sem isso, os ring-
         # consumers eternos do vnccontrol herdavam o lock e o 2º run do
         # one-liner morria "Outra execução em andamento" NA FROTA INTEIRA.
-        if timeout 180 "$vncbin" --session-apps start 9>&- 8>&-; then
+        # v.261126b (R2): o app sobe dentro de um SCOPE próprio da system.slice
+        # para NÃO ficar no cgroup de quem chamou o instalador (sessão SSH,
+        # serviço de agente…) — com KillMode=control-group, derrubar a unidade
+        # do chamador levava o Pinokio, o Caddy e o SearXNG junto. Sem
+        # systemd-run (ou sem root): como antes.
+        local -a autostart_cmd=(timeout 180 "$vncbin" --session-apps start)
+        if systemd_scope_available; then
+            autostart_cmd=(systemd-run --quiet --scope --unit="pinokio-autostart-$(date +%s)-$$" \
+                           --slice=system.slice -- "${autostart_cmd[@]}")
+        fi
+        if "${autostart_cmd[@]}" 9>&- 8>&-; then
             PERSIST_STATUS="aplicada"
         else
             warn "'$vncbin --session-apps start' retornou erro."
@@ -1659,31 +1838,40 @@ app_bin_ok                || FAIL="${FAIL:+$FAIL; }binário $APP_BIN ausente/nã
 installed_glibc_ok        || FAIL="${FAIL:+$FAIL; }pty.node incompatível com o GLIBC do host ($HOST_GLIBC)"
 [ -x "$PC_BIN_DIR/pinokiocontrol" ] || FAIL="${FAIL:+$FAIL; }pinokiocontrol não instalado"
 [ "$PERSIST_STATUS" != "falhou" ]  || FAIL="${FAIL:+$FAIL; }persistência/autostart falhou"
-[ "$RESTART_STATUS" != "falhou" ]  || FAIL="${FAIL:+$FAIL; }Pinokio não voltou após a troca de arquivos (suba com: pinokiocontrol --start; para voltar a versão anterior: PINOKIO_INSTALLER_VERSION=${CURRENT_VER:-<versão>} + este instalador)"
+[ "$RESTART_STATUS" != "falhou" ]  || FAIL="${FAIL:+$FAIL; }$RESTART_FAIL"
 [ "$SHA_UNVERIFIED" = 0 ]          || FAIL="${FAIL:+$FAIL; }sha256 do asset NÃO verificado (modo fallback sem API)"
 grep -q "^VERSION=$CAND_VER$" "$STATE_FILE" 2>/dev/null \
                           || FAIL="${FAIL:+$FAIL; }state não registra a versão instalada"
 
-# SearXNG na 8888 ( informativo — rede padrão; NUNCA reconfiguramos portas)
-searx_code() {
-    local c
-    c=$(curl -m 5 -sS -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8888/search?q=x&format=json' 2>/dev/null) || c="000"
-    printf '%s' "${c:-000}"
-}
 SEARX_8888="$(searx_code)"
 if [ "$SEARX_8888" != 200 ] && [ "$RESTART_STATUS" = "reiniciado" ]; then
     # v.261126a: o app ACABOU de subir e o Home Server (SearXNG) leva alguns
-    # segundos — julgar a :8888 na hora era corrida (aviso falso). Até 90s.
-    for _ in $(seq 1 30); do
+    # segundos — julgar a :8888 na hora era corrida (aviso falso). Espera até
+    # PINOKIO_SEARX_WAIT s (default 90; cada tentativa tem 5 s de timeout).
+    searx_deadline=$(( $(date +%s) + SEARX_WAIT ))
+    while [ "$(date +%s)" -lt "$searx_deadline" ]; do
         sleep 3
         SEARX_8888="$(searx_code)"
         if [ "$SEARX_8888" = 200 ]; then break; fi
     done
 fi
+if [ "$RESTART_STATUS" = "reiniciado" ]; then
+    # v.261126b (R2): "reiniciado" só vale se o app ainda estiver vivo AQUI —
+    # o --start devolve 0 na primeira resposta 200 da porta, e um app que
+    # morre em seguida passava sem aviso nenhum.
+    managed_app_pids
+    [ -n "$MANAGED_PIDS" ] || FAIL="${FAIL:+$FAIL; }o Pinokio MORREU logo após o reinício (nenhum processo do app) — rode: pinokiocontrol --start e veja o log do app"
+    if [ "$SEARX_BEFORE" = 200 ] && [ "$SEARX_8888" != 200 ]; then
+        FAIL="${FAIL:+$FAIL; }o SearXNG (:8888) estava no ar antes da troca e NÃO voltou depois do reinício"
+    fi
+fi
 if [ "$SEARX_8888" = 200 ]; then
     info "SearXNG responde em :8888 (padrão da rede) — http 200"
-elif pgrep -f '[p]inokio-bin' >/dev/null 2>&1; then
-    warn "Pinokio ativo mas SearXNG não respondeu em :8888 (http $SEARX_8888) — app SearXNG parado dentro do Pinokio?"
+else
+    managed_app_pids
+    if [ -n "$MANAGED_PIDS" ]; then
+        warn "Pinokio ativo mas SearXNG não respondeu em :8888 (http $SEARX_8888) — app SearXNG parado dentro do Pinokio?"
+    fi
 fi
 
 echo "--------------------------------------------------------------"
