@@ -1,6 +1,6 @@
 # pinokiocontrol — instalador headless-first + CLI de controle para o Pinokio
 
-[![version](https://img.shields.io/badge/version-261126b--pub1-766b90)](https://github.com/iamnexa-us/pinokiocontrol)
+[![version](https://img.shields.io/badge/version-261126c--pub1-766b90)](https://github.com/iamnexa-us/pinokiocontrol)
 [![platform](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![GitHub repo](https://img.shields.io/badge/github-pinokiocontrol-181717?logo=github&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
@@ -39,12 +39,21 @@ curl -fsSL https://raw.githubusercontent.com/iamnexa-us/pinokiocontrol/main/inst
   próprio do systemd (nunca no cgroup de quem rodou o instalador); e o
   veredito confere se o app — e o SearXNG que estava no ar antes — voltaram
   mesmo. `PINOKIO_SKIP_AUTOSTART=1` pula o reinício (o build antigo continua
-  rodando; o instalador avisa).
+  rodando; o instalador avisa). Se o lançamento isolado não subir, ele tenta
+  mais uma vez sem isolamento e avisa. E uma varredura de `/proc` que falha
+  nunca é lida como "o app está parado": o instalador e o `pinokiocontrol`
+  recusam (rc=1) em vez de agir no achismo.
 - **Nunca rebaixa uma instalação sã** — quando a latest é recusada, o
   instalador só vai para uma known-good mais *nova* do que a instalada. Uma
   instalação sã acima da known-good fica onde está. (Até a v.261126a o
   one-liner a rebaixava em silêncio.) Um `PINOKIO_INSTALLER_VERSION` explícito
-  continua podendo voltar atrás de propósito.
+  continua podendo voltar atrás de propósito. Dano crítico de arquivos nessa
+  instalação continua sendo reparado (REINSTALL da mesma versão), e o
+  `pinokiocontrol --update` percebe quando o binário do app sumiu.
+- **`PINOKIO_INSTALLER_KNOWN_GOODS` é validado antes de tudo** — a lista é
+  injetada no `pinokiocontrol` gerado, então qualquer coisa além de versões
+  separadas por espaço (aspas, quebras de linha, sintaxe de shell) para o
+  instalador antes de ele tocar na máquina.
 - **Auto-updater neutralizado por padrão** — atualizações só acontecem quando
   VOCÊ roda, através do gate. Chega de autodestruição silenciosa às 3 da manhã.
 - **Health checks com auto-reparo** — binário, desktop entry, ícones,
@@ -70,7 +79,11 @@ pinokiocontrol --help | --version
 
 O `--stop` escala com elegância (TERM → até 10 s → KILL) e espera a morte real
 antes de retornar. O `--persistent` gerencia só o próprio registro e nunca
-toca em outros apps de sessão.
+toca em outros apps de sessão. O `--status` não precisa de root; sem root ele
+responde `ativo: n/d` em vez de um "não está ativo" errado (não dá para ler
+`/proc/<pid>/exe` de processos de outros usuários). `--start`, `--stop` e
+`--restart` recusam (rc=1) quando a varredura de `/proc` falha, em vez de
+agir no achismo.
 
 ## O que o instalador decide (tudo honesto, tudo logado)
 

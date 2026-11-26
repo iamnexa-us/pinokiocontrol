@@ -1,6 +1,6 @@
 # pinokiocontrol — headless-first installer & control CLI for Pinokio
 
-[![version](https://img.shields.io/badge/version-261126b--pub1-766b90)](https://github.com/iamnexa-us/pinokiocontrol)
+[![version](https://img.shields.io/badge/version-261126c--pub1-766b90)](https://github.com/iamnexa-us/pinokiocontrol)
 [![platform](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![GitHub repo](https://img.shields.io/badge/github-pinokiocontrol-181717?logo=github&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
@@ -39,12 +39,21 @@ curl -fsSL https://raw.githubusercontent.com/iamnexa-us/pinokiocontrol/main/inst
   own systemd scope (never in the cgroup of whoever ran the installer); and
   the verdict checks that the app — and the SearXNG that was up before —
   actually came back. `PINOKIO_SKIP_AUTOSTART=1` skips the restart (the old
-  build keeps running; the installer says so).
+  build keeps running; the installer says so). If the isolated launch cannot
+  start, it tries once more without isolation and says so. And a `/proc` scan
+  that fails is never read as "the app is stopped": the installer and
+  `pinokiocontrol` refuse (rc=1) instead of acting on a guess.
 - **Never downgrades a healthy install** — when the latest release is
   refused, the installer only moves to a known-good that is *newer* than
   what is installed. A healthy install above the known-good stays where it
   is. (Until v.261126a the one-liner silently downgraded it.) An explicit
-  `PINOKIO_INSTALLER_VERSION` can still roll back on purpose.
+  `PINOKIO_INSTALLER_VERSION` can still roll back on purpose. Critical file
+  damage on that install is still repaired (REINSTALL of the same version),
+  and `pinokiocontrol --update` notices when the app binary is missing.
+- **`PINOKIO_INSTALLER_KNOWN_GOODS` is validated first** — the list is
+  injected into the generated `pinokiocontrol`, so anything other than
+  space-separated versions (quotes, newlines, shell syntax) stops the
+  installer before it touches the machine.
 - **Auto-updater neutralized by default** — updates happen only when YOU run
   them, through the gate. No more silent self-destruction at 3 a.m.
 - **Self-healing health checks** — binary, desktop entry, icons, permissions,
@@ -70,7 +79,11 @@ pinokiocontrol --help | --version
 
 `--stop` escalates gracefully (TERM → up to 10 s → KILL) and waits for real
 death before returning. `--persistent` only manages its own registration and
-never touches other session apps.
+never touches other session apps. `--status` does not need root; without
+root it answers `ativo: n/d` instead of a wrong "not running" (it cannot
+read `/proc/<pid>/exe` of other users' processes). `--start`, `--stop` and
+`--restart` refuse (rc=1) when the `/proc` scan fails, rather than act on
+a guess.
 
 ## What the installer decides (all honest, all logged)
 
