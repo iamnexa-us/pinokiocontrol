@@ -81,7 +81,11 @@
 #      2ª instância ("não sei" nunca é "não subiu": o poll da porta decide). As
 #      chamadas em primeiro plano do systemd-run têm teto (20 s na sonda, 200 s
 #      na que envolve o vnccontrol). O CLI novo só substitui o anterior depois
-#      de validado — o anterior que funcionava nunca mais é removido.
+#      de validado — o anterior que funcionava nunca mais é removido, e a troca (mv)
+#      é conferida. O veredito final também confere o executável real e o payload; o
+#      ELF tem de ter conteúdo (número mágico). Quando a sonda do systemd-run falha
+#      com ele presente (ex.: contêiner), o instalador avisa que os session-apps
+#      sobem SEM isolamento de cgroup. Tetos com -k.
 #
 # NOTA DE REDE (host-arsenal): SearXNG é SEMPRE acessado em :8888 (Home
 # Server do Pinokio). O instalador NUNCA reconfigura portas — só verifica.
@@ -190,10 +194,14 @@ healed(){ echo "[HEAL]  $*"; HEALED_ITEMS="${HEALED_ITEMS:+$HEALED_ITEMS; }$*"; 
 skip()  { echo "[SKIP]  $*"; }
 die()   { echo "[ERRO]  $*" >&2; exit 1; }
 
+PC_TMP=""; PC_MV_FAILED=0
 cleanup() {
     if [ "$DL_DIR_CREATED" = "1" ] && [ -n "$DL_DIR" ] && [ -d "$DL_DIR" ]; then
         rm -rf "$DL_DIR"
     fi
+    # v.261126e (R2, rodada 4): o temporário do CLI também sai numa morte abrupta do instalador
+    [ -n "${PC_TMP:-}" ] && rm -f "$PC_TMP"
+    return 0
 }
 trap cleanup EXIT
 
@@ -435,8 +443,19 @@ app_bin_ok()      { [ -f "$APP_BIN" ] && [ -x "$APP_BIN" ]; }
 # respondia "já atualizado". Agora o conjunto crítico inclui o ELF (pinokio-bin, o
 # nome que o próprio wrapper declara) e o payload (app.asar — ou o diretório
 # resources/app, o layout alternativo do Electron).
-elf_ok()          { [ -f "$APP_DIR/pinokio-bin" ] && [ -x "$APP_DIR/pinokio-bin" ]; }
-app_payload_ok()  { [ -s "$APP_DIR/resources/app.asar" ] || [ -d "$APP_DIR/resources/app" ]; }
+# v.261126e (R2, rodada 4): CONTEÚDO mínimo. Um arquivo vazio, um texto — qualquer coisa com bit
+# de execução — passava como ELF são (o asar vazio já era pego). Agora o ELF tem de começar com o
+# número mágico (0x7f "ELF"): exclui vazio e texto. Um ELF truncado DEPOIS do cabeçalho passa;
+# conferir isso é trabalho de "dpkg -V". Um diretório resources/app VAZIO não é payload.
+elf_ok() {
+    local m
+    [ -f "$APP_DIR/pinokio-bin" ] && [ -x "$APP_DIR/pinokio-bin" ] \
+        && m=$(head -c 4 "$APP_DIR/pinokio-bin" 2>/dev/null) && [ "$m" = $'\x7fELF' ]
+}
+app_payload_ok() {
+    [ -s "$APP_DIR/resources/app.asar" ] \
+        || { [ -d "$APP_DIR/resources/app" ] && [ -n "$(ls -A "$APP_DIR/resources/app" 2>/dev/null)" ]; }
+}
 sandbox_present() { [ -f "$SANDBOX_BIN" ]; }
 icons_ok() {
     local f
@@ -972,6 +991,7 @@ install_pinokiocontrol() {
     pc_new="$PC_BIN_DIR/pinokiocontrol"
     pc_tmp=$(mktemp "$PC_BIN_DIR/.pinokiocontrol.XXXXXX") \
         || { warn "não consegui criar o temporário do CLI em $PC_BIN_DIR — pinokiocontrol não instalado."; return 1; }
+    PC_TMP="$pc_tmp"
     cat > "$pc_tmp" <<'PINOKIOCONTROL_EOF'
 #!/bin/bash
 # pinokiocontrol v.__SCRIPT_VERSION__ — controle local do Pinokio (padrão iamnexa)
@@ -1065,16 +1085,26 @@ is_running()   { app_state; }   # rc 2 = desconhecido; quem precisa distinguir u
 # v.261126e (R1, rodada 3): "binário presente" é o launcher E o executável real (pinokio-bin)
 # E o payload (app.asar — ou resources/app) — não só o wrapper de 746 bytes. Com o ELF
 # apagado ou sem bit de execução, o --update respondia "já atualizado".
-# (mesmo nome e mesma regra do app_payload_ok do instalador — que olha $APP_DIR: como as
-#  outras funções gêmeas do CLI e do instalador, são dois scripts autossuficientes)
-app_payload_ok() { [ -s "$OPT_PINOKIO/resources/app.asar" ] || [ -d "$OPT_PINOKIO/resources/app" ]; }
+# (mesmo nome e mesma regra das funções gêmeas do instalador — que olham $APP_DIR: são dois
+#  scripts autossuficientes. O conjunto AQUI é o do diretório do app: launcher, ELF e payload.
+#  O do instalador, em critical_damage, inclui também o chrome-sandbox e o ícone, que são do
+#  sistema — o CLI não os olha.)
+app_payload_ok() {
+    [ -s "$OPT_PINOKIO/resources/app.asar" ] \
+        || { [ -d "$OPT_PINOKIO/resources/app" ] && [ -n "$(ls -A "$OPT_PINOKIO/resources/app" 2>/dev/null)" ]; }
+}
+elf_ok() {   # não vazio e com o número mágico de ELF (R2, rodada 4) — mesma regra do instalador
+    local m
+    [ -f "$OPT_PINOKIO/pinokio-bin" ] && [ -x "$OPT_PINOKIO/pinokio-bin" ] \
+        && m=$(head -c 4 "$OPT_PINOKIO/pinokio-bin" 2>/dev/null) && [ "$m" = $'\x7fELF' ]
+}
 app_files_ok() {
-    [ -x "$OPT_PINOKIO/pinokio" ] && [ -x "$OPT_PINOKIO/pinokio-bin" ] && app_payload_ok
+    [ -x "$OPT_PINOKIO/pinokio" ] && elf_ok && app_payload_ok
 }
 app_files_missing() {   # o que falta (para as mensagens)
     local m=""
     [ -x "$OPT_PINOKIO/pinokio" ]     || m="$m $OPT_PINOKIO/pinokio"
-    [ -x "$OPT_PINOKIO/pinokio-bin" ] || m="$m $OPT_PINOKIO/pinokio-bin"
+    elf_ok                            || m="$m $OPT_PINOKIO/pinokio-bin"
     app_payload_ok                    || m="$m $OPT_PINOKIO/resources/app.asar"
     printf '%s' "${m# }"
 }
@@ -1090,7 +1120,7 @@ launch_isolation_probe() {   # 0 = dá para isolar (a sonda some na hora)
     [ -d /run/systemd/system ] || return 1
     [ "$(id -u)" = 0 ] || return 1
     LAUNCH_UNIT="pinokio-live-$(date +%s)-$$"
-    timeout 20 systemd-run --quiet --scope --unit="pinokio-probe-$$" --slice=system.slice -- true 2>/dev/null
+    timeout -k 5 20 systemd-run --quiet --scope --unit="pinokio-probe-$$" --slice=system.slice -- true 2>/dev/null
 }
 launch_isolated() {   # $1 = teto (s) da própria chamada do systemd-run; $2.. = comando que sobe o app
     if [ -n "${LAUNCH_ISOLATION:-}" ]; then
@@ -1099,7 +1129,8 @@ launch_isolated() {   # $1 = teto (s) da própria chamada do systemd-run; $2.. =
         # com o app já parado. O teto é MAIOR que o do comando interno (150/180 s): ele
         # só alcança o systemd-run em si. (As linhas que lançam o APP em segundo plano
         # NÃO levam teto — o systemd-run --scope vive enquanto o app vive.)
-        timeout "$1" systemd-run --quiet --scope --unit="$LAUNCH_UNIT" --slice=system.slice -- "${@:2}"
+        # (-k: quem ignora TERM também é limitado — R2, rodada 4)
+        timeout -k 10 "$1" systemd-run --quiet --scope --unit="$LAUNCH_UNIT" --slice=system.slice -- "${@:2}"
     else
         shift
         "$@"
@@ -1384,7 +1415,11 @@ direct_launch() {
         # or $DISPLAY") em ~0,5 s — e a varredura, que via o processo ainda vivo,
         # dava o lançamento por bom. App fora do ar depois de um --restart, com o
         # SearXNG :8888 junto. (A suíte não viu: o app falso não precisa de DISPLAY.)
-        env -u DBUS_SESSION_BUS_ADDRESS ${dbusa:+$dbusa} DISPLAY="$DISPLAY_VNC" XDG_SESSION_TYPE=x11 \
+        # v.261126e (R1, rodada 4 — interim do achado M4 da R2, até a lista explícita na `f`):
+        # o app HERDA o ambiente de quem chamou; estas quatro derrubam ou redirecionam um
+        # Electron (ELECTRON_RUN_AS_NODE, NODE_OPTIONS, LD_PRELOAD) ou levam a chave de um
+        # agente SSH até o app. Não chegam a ele — nas DUAS tentativas.
+        env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK -u ELECTRON_RUN_AS_NODE -u NODE_OPTIONS -u LD_PRELOAD ${dbusa:+$dbusa} DISPLAY="$DISPLAY_VNC" XDG_SESSION_TYPE=x11 \
             setsid nohup systemd-run --quiet --scope --unit="${LAUNCH_UNIT}-d" --slice=system.slice -- \
             "$OPT_PINOKIO/pinokio" --no-sandbox >>"$logf" 2>&1 8>&- 9>&- &
         launch_settled; _ls=$?
@@ -1402,7 +1437,7 @@ direct_launch() {
         # morreu no arranque. Sem esta segunda tentativa o app ficaria fora do ar.
         say "aviso: o lançamento isolado (scope ${LAUNCH_UNIT}-d) não subiu o app — tentando SEM isolamento (o app fica no cgroup de quem chamou)"
     fi
-    env -u DBUS_SESSION_BUS_ADDRESS ${dbusa:+$dbusa} DISPLAY="$DISPLAY_VNC" XDG_SESSION_TYPE=x11 \
+    env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK -u ELECTRON_RUN_AS_NODE -u NODE_OPTIONS -u LD_PRELOAD ${dbusa:+$dbusa} DISPLAY="$DISPLAY_VNC" XDG_SESSION_TYPE=x11 \
         setsid nohup "$OPT_PINOKIO/pinokio" --no-sandbox >>"$logf" 2>&1 8>&- 9>&- &
 }
 cmd_start() {
@@ -1706,7 +1741,7 @@ PINOKIOCONTROL_EOF
     # O placeholder tem mesmo sumir, e o CLI gerado tem de ser sintaticamente
     # válido: um __X__ literal ou uma aspa a mais deixava um CLI quebrado — e o
     # instalador imprimia [OK] com rc=0 (R1 rodada 2, N3). Agora é reprovação,
-    # e o arquivo inválido não fica no lugar.
+    # e o arquivo inválido não fica no lugar (o anterior, se havia, fica).
     if grep -q '__[A-Z_]*__' "$pc_tmp" 2>/dev/null || ! bash -n "$pc_tmp" 2>/dev/null; then
         PC_PLACEHOLDER=1
         rm -f "$pc_tmp"
@@ -1719,7 +1754,15 @@ PINOKIOCONTROL_EOF
         return 1
     fi
     chmod 755 "$pc_tmp"
-    mv -f "$pc_tmp" "$pc_new"
+    # v.261126e (R1, rodada 4): a troca é conferida. Com o mv falhando (alvo imutável…) o
+    # instalador imprimia "[OK]", rc=0, mantinha o CLI antigo e deixava o temporário para trás.
+    if ! mv -f "$pc_tmp" "$pc_new"; then
+        rm -f "$pc_tmp"; PC_TMP=""
+        PC_MV_FAILED=1
+        warn "não consegui substituir $pc_new pelo CLI novo (mv falhou) — o ANTERIOR foi mantido."
+        return 1
+    fi
+    PC_TMP=""
     mkdir -p "$PC_LINK_DIR" 2>/dev/null || true
     ln -sf "$PC_BIN_DIR/pinokiocontrol" "$PC_LINK" 2>/dev/null \
         || warn "symlink $PC_LINK falhou (use $PC_BIN_DIR/pinokiocontrol)"
@@ -1762,10 +1805,10 @@ health_check_and_heal() {
     if elf_ok; then
         ok "Executável do app: $APP_DIR/pinokio-bin"
     else
-        warn "Executável do app ausente ou sem bit de execução: $APP_DIR/pinokio-bin (dano crítico — reinstall necessário)."
+        warn "Executável do app ausente, vazio, sem bit de execução ou sem cabeçalho de ELF: $APP_DIR/pinokio-bin (dano crítico — reinstall necessário)."
     fi
     if app_payload_ok; then
-        ok "Payload do app: $APP_DIR/resources/app.asar"
+        ok "Payload do app: $APP_DIR/resources (app.asar ou app/)"
     else
         warn "Payload do app ausente ou vazio: $APP_DIR/resources/app.asar (dano crítico — reinstall necessário)."
     fi
@@ -1899,7 +1942,7 @@ systemd_scope_available() {
     command -v systemd-run >/dev/null 2>&1 || return 1
     [ -d /run/systemd/system ] || return 1
     [ "$(id -u)" = 0 ] || return 1
-    timeout 20 systemd-run --quiet --scope --unit="pinokio-probe-$$" --slice=system.slice -- true 2>/dev/null
+    timeout -k 5 20 systemd-run --quiet --scope --unit="pinokio-probe-$$" --slice=system.slice -- true 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -2091,14 +2134,21 @@ persist_autostart() {
         # do chamador levava o Pinokio, o Caddy e o SearXNG junto. Sem
         # systemd-run (ou sem root): como antes.
         local -a autostart_cmd=(timeout 180 "$vncbin" --session-apps start)
-        local autostart_isolated=0
+        local autostart_isolated=0 autostart_sem_isolamento=""
         if systemd_scope_available; then
             autostart_isolated=1
-            autostart_cmd=(timeout 200 systemd-run --quiet --scope --unit="pinokio-autostart-$(date +%s)-$$" \
+            autostart_cmd=(timeout -k 10 200 systemd-run --quiet --scope --unit="pinokio-autostart-$(date +%s)-$$" \
                            --slice=system.slice -- "${autostart_cmd[@]}")
+        elif command -v systemd-run >/dev/null 2>&1 && [ "$(id -u)" = 0 ] && [ -d /run/systemd/system ]; then
+            # v.261126e (R2, rodada 4): o systemd-run existe e somos root — foi a SONDA que falhou
+            # (ou travou até o teto; ex.: contêiner). Os session-apps sobem SEM isolamento de cgroup
+            # e ficam no cgroup de quem chamou. Antes: "Persistência: aplicada", sem dizer isso.
+            # (O pinokiocontrol --start já avisava no mesmo caso.)
+            autostart_sem_isolamento=" (SEM isolamento de cgroup: a sonda do systemd-run falhou ou travou até o teto — os session-apps ficam no cgroup de quem chamou)"
+            warn "o systemd-run não respondeu à sonda (falhou ou travou até o teto de 20 s) — os session-apps sobem SEM isolamento de cgroup: ficam no cgroup de quem chamou."
         fi
         if "${autostart_cmd[@]}" 9>&- 8>&-; then
-            PERSIST_STATUS="aplicada"
+            PERSIST_STATUS="aplicada$autostart_sem_isolamento"
         elif [ "$autostart_isolated" = 1 ]; then
             # v.261126c (R2 rodada 2, N2): o systemd-run falhou DEPOIS da sonda
             # (nome de unidade ocupado, D-Bus…). Sem a segunda tentativa os
@@ -2145,12 +2195,18 @@ fi
 [ -f "$DESKTOP_FILE" ]    || FAIL="${FAIL:+$FAIL; }desktop entry ausente"
 icons_ok                  || FAIL="${FAIL:+$FAIL; }ícone hicolor ausente"
 app_bin_ok                || FAIL="${FAIL:+$FAIL; }binário $APP_BIN ausente/não executável"
+# v.261126e (R2, rodada 4): o veredito também confere o executável REAL e o payload — a decisão
+# (REINSTALL) e a auditoria já olhavam, mas um reparo que "concluía" (apt-get rc 0) SEM repor o
+# arquivo saía como "VEREDITO: OK".
+elf_ok                    || FAIL="${FAIL:+$FAIL; }executável do app ausente, vazio, sem bit de execução ou sem cabeçalho de ELF: $APP_DIR/pinokio-bin"
+app_payload_ok            || FAIL="${FAIL:+$FAIL; }payload do app ausente: $APP_DIR/resources/app.asar"
 [ -f "$SANDBOX_BIN" ]     || FAIL="${FAIL:+$FAIL; }chrome-sandbox ausente"
 [ "$(stat -c %a "$SANDBOX_BIN" 2>/dev/null || echo '')" = "$SANDBOX_WANT_PERM" ] \
                           || FAIL="${FAIL:+$FAIL; }permissão do chrome-sandbox divergente do postinst oficial"
 installed_glibc_ok        || FAIL="${FAIL:+$FAIL; }pty.node incompatível com o GLIBC do host ($HOST_GLIBC)"
 [ -x "$PC_BIN_DIR/pinokiocontrol" ] || FAIL="${FAIL:+$FAIL; }pinokiocontrol não instalado"
-[ "$PC_PLACEHOLDER" = 0 ]        || FAIL="${FAIL:+$FAIL; }o pinokiocontrol gerado ficou inválido e foi removido"
+[ "$PC_PLACEHOLDER" = 0 ]        || FAIL="${FAIL:+$FAIL; }o pinokiocontrol gerado ficou inválido e foi descartado (o anterior, se havia, foi mantido)"
+[ "$PC_MV_FAILED" = 0 ]          || FAIL="${FAIL:+$FAIL; }o CLI novo não substituiu o anterior (mv falhou) — o anterior segue no lugar; rode de novo"
 [ "$PERSIST_STATUS" != "falhou" ]  || FAIL="${FAIL:+$FAIL; }persistência/autostart falhou"
 [ "$RESTART_STATUS" != "falhou" ]  || FAIL="${FAIL:+$FAIL; }$RESTART_FAIL"
 [ "$SHA_UNVERIFIED" = 0 ]          || FAIL="${FAIL:+$FAIL; }sha256 do asset NÃO verificado (modo fallback sem API)"
