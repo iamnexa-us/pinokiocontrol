@@ -1,6 +1,6 @@
 # pinokiocontrol — instalador headless-first + CLI de controle para o Pinokio
 
-[![version](https://img.shields.io/badge/version-261121f--pub1-766b90)](https://github.com/iamnexa-us/pinokiocontrol)
+[![version](https://img.shields.io/badge/version-261126a--pub1-766b90)](https://github.com/iamnexa-us/pinokiocontrol)
 [![platform](https://img.shields.io/badge/platform-Linux-informational?logo=linux&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![GitHub repo](https://img.shields.io/badge/github-pinokiocontrol-181717?logo=github&logoColor=white)](https://github.com/iamnexa-us/pinokiocontrol)
@@ -28,7 +28,14 @@ curl -fsSL https://raw.githubusercontent.com/iamnexa-us/pinokiocontrol/main/inst
   release que morreria no lançamento é recusada, com fallback automático para a
   última versão boa. (Nasceu de um incidente real: a 8.4.0 upstream foi
   compilada numa imagem de CI rolante exigindo `GLIBC_2.42` e derrubou frotas
-  inteiras em Debian 12/13 e Ubuntu LTS.)
+  inteiras em Debian 12/13 e Ubuntu LTS.) O cache do gate é atrelado à
+  **identidade do asset** que ele avaliou (sha256): se o upstream substituir um
+  `.deb` sob a mesma tag — como fez com a 8.4.1 em 25/11/2026 — o instalador o
+  reavalia sozinho em vez de confiar num veredito vencido.
+- **Reinício após a upgrade** — UPGRADE/REPAIR/REINSTALL trocam os arquivos em
+  disco, então o instalador reinicia o app se ele estava no ar (só os
+  processos da própria instalação são tocados). Chega de "upgrade concluído"
+  com o build antigo ainda rodando.
 - **Auto-updater neutralizado por padrão** — atualizações só acontecem quando
   VOCÊ roda, através do gate. Chega de autodestruição silenciosa às 3 da manhã.
 - **Health checks com auto-reparo** — binário, desktop entry, ícones,
@@ -59,9 +66,9 @@ toca em outros apps de sessão.
 | Estado da máquina | Ação |
 |---|---|
 | Sem Pinokio | **INSTALL** do melhor candidato compatível |
-| Antigo, latest compatível | **UPGRADE** (dados do usuário preservados) |
+| Antigo, latest compatível | **UPGRADE** (dados do usuário preservados; reinicia se estava no ar) |
 | Já na melhor e saudável | **SKIP** — audita, não baixa nada |
-| Dano crítico de arquivos | **REINSTALL** da mesma versão |
+| Dano crítico de arquivos | **REINSTALL** da mesma versão (reinicia se estava no ar) |
 | Binário instalado incompatível (GLIBC) | **REPAIR** — downgrade automático p/ known-good |
 | Latest incompatível | **PINNED** — mantém a known-good, nota explícita |
 | Todos os candidatos reprovados, instalação são | **ADOPTION** — mantém a atual, protege |
@@ -73,7 +80,7 @@ toca em outros apps de sessão.
 `PINOKIO_INSTALLER_DL_DIR`, `PINOKIO_INSTALLER_VERSION` (pin exato),
 `PINOKIO_INSTALLER_KNOWN_GOODS`, `PINOKIO_ALLOW_AUTOUPDATE`,
 `PINOKIO_SKIP_AUTOSTART`, `PINOKIOCONTROL_BIN_DIR`, `PINOKIOCONTROL_LINK_DIR`,
-`GITHUB_TOKEN`.
+`PINOKIO_GATE_CACHE_TTL`, `GITHUB_TOKEN`.
 
 ## Licença
 

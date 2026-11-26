@@ -19,7 +19,13 @@
 #      inspecionado (objdump): exige GLIBC > host => candidato REJEITADO.
 #      Fallback automático para o último KNOWN_GOOD (default 8.3.7); o
 #      veredito do gate é cacheado por (versão, glibc do host) para não
-#      baixar 128MB de novo a cada rerun idempotente.
+#      baixar 128MB de novo a cada rerun idempotente — e, desde a v.261126a,
+#      junto com a IDENTIDADE do asset avaliado (sha256): o upstream
+#      substituiu o .deb da 8.4.1 NO LUGAR (mesma tag) em 2026-11-25 e o
+#      veredito do build quebrado, cacheado só por versão, bloqueou a
+#      correção. Hoje um "incompatível" só pula o download se o asset
+#      publicado for o MESMO que foi avaliado (ou se o veredito for
+#      recente, quando a API não informa o digest).
 #   4. AUTO-REPARO: instalação existente com pty.node incompatível (ex.:
 #      alguém rodou o .deb na mão / auto-update interno) => DOWNGRADE
 #      automático para o melhor candidato compatível. (O "nunca downgrade"
@@ -39,6 +45,11 @@
 #   8. Verifica o sha256 do asset (publicado pelo upstream) antes de instalar.
 #   9. AUTO-VERIFICAÇÃO final com veredito claro (rc=0 OK / rc=1 RESSALVAS).
 #      Instância única garantida por flock (sem instalações concorrentes).
+#  10. REINÍCIO após troca de arquivos (v.261126a): UPGRADE/REPAIR/REINSTALL
+#      com o app em execução => "pinokiocontrol --restart" no fim. Antes o
+#      processo antigo seguia rodando o build antigo (pelos inodes antigos)
+#      até alguém reiniciar, com o veredito dizendo "UPGRADE concluído".
+#      Só processos do NOSSO /opt/Pinokio contam como "em execução".
 #
 # NOTA DE REDE (host-arsenal): SearXNG é SEMPRE acessado em :8888 (Home
 # Server do Pinokio). O instalador NUNCA reconfigura portas — só verifica.
@@ -57,11 +68,14 @@
 #   PINOKIOCONTROL_BIN_DIR         destino do pinokiocontrol (default /opt/pinokiocontrol/bin)
 #   PINOKIOCONTROL_LINK_DIR        dir do symlink (default /usr/local/bin)
 #   VNCCONTROL_STATE_DIR           STATE_DIR do vnccontrol (detecta sozinho se vazio)
+#   PINOKIO_GATE_CACHE_TTL         prazo (s) de um veredito "incompatível" em
+#                                  cache QUANDO a API não informa o digest do
+#                                  asset (default 86400 = 24h)
 #   GITHUB_TOKEN                   opcional, alivia rate limit da API do GitHub
 
 set -euo pipefail
 
-SCRIPT_VERSION="261121f-pub1"
+SCRIPT_VERSION="261126a-pub1"
 APP="pinokio"
 PKG="pinokio"
 UP_REPO="${PINOKIO_INSTALLER_REPO:-pinokiocomputer/pinokio}"
@@ -80,6 +94,13 @@ STATE_FILE="$STATE_DIR/state"
 HISTORY_FILE="$STATE_DIR/history.log"
 LOCK_FILE="$STATE_DIR/lock"
 GATE_CACHE="$STATE_DIR/glibc-gate.cache"
+# v.261126a: prazo (segundos) de confiança de um veredito "incompatível" em
+# cache QUANDO não há como conferir a identidade do asset (API do GitHub fora
+# ou sem digest). Com a identidade conferível (sha256 da API) o prazo não
+# entra em jogo: asset diferente => reavalia, seja qual for a idade.
+GATE_CACHE_TTL="${PINOKIO_GATE_CACHE_TTL:-86400}"
+case "$GATE_CACHE_TTL" in ''|*[!0-9]*) GATE_CACHE_TTL=86400 ;; esac
+APP_DIR="$SYS_ROOT/opt/Pinokio"          # (= dirname de APP_BIN) dir do app
 
 # --- pinokiocontrol --------------------------------------------------------
 PC_BIN_DIR="${PINOKIOCONTROL_BIN_DIR:-$SYS_ROOT/opt/pinokiocontrol/bin}"
@@ -259,16 +280,63 @@ HOST_GLIBC="$(host_glibc)"
 [ -n "$HOST_GLIBC" ] && info "GLIBC do host: $HOST_GLIBC" \
                      || warn "não consegui ler o glibc do host (ldd) — gate GLIBC menos estrito."
 
-# Cache do veredito do gate: "versao deb|glibc host -> NEED" (evita baixar
-# de novo um .deb que já sabemos ser incompatível neste host).
-gate_cache_get() {  # $1=versao deb  $2=glibc host => echo NEED (vazio se não cacheado)
-    [ -f "$GATE_CACHE" ] || return 0
-    sed -n "s/^$1|$2 -> //p" "$GATE_CACHE" 2>/dev/null | tail -1
+# Cache do veredito do gate — uma linha por (versão, glibc do host):
+#     versao|glibc -> NEED sha256=<asset AVALIADO> at=<epoch>
+# NEED é o maior GLIBC que o pty.node do .deb exige (como sempre). sha256/at
+# são a IDENTIDADE do que foi avaliado (v.261126a). Linhas do formato antigo
+# (só o NEED) continuam legíveis, mas NUNCA servem para pular um download:
+# não há como saber de que asset são — reavalia uma vez e reescreve.
+# gate_cache_lookup preenche CACHE_NEED / CACHE_SHA / CACHE_AT.
+gate_cache_lookup() {  # $1=versao $2=glibc → 0 = há entrada (1 = não há)
+    local line kv ver_re glibc_re
+    CACHE_NEED=""; CACHE_SHA=""; CACHE_AT=""
+    [ -r "$GATE_CACHE" ] || return 1
+    ver_re="${1//./\\.}"; glibc_re="${2//./\\.}"
+    line=$(sed -n "s/^$ver_re|$glibc_re -> //p" "$GATE_CACHE" 2>/dev/null | tail -1) || line=""
+    [ -n "$line" ] || return 1
+    CACHE_NEED="${line%%[[:space:]]*}"
+    for kv in ${line#"$CACHE_NEED"}; do
+        case "$kv" in
+            sha256=*) CACHE_SHA="${kv#sha256=}" ;;
+            at=*)     CACHE_AT="${kv#at=}" ;;
+        esac
+    done
+    case "$CACHE_AT" in *[!0-9]*) CACHE_AT="" ;; esac   # corrompida = sem data
+    return 0
 }
-gate_cache_put() {  # $1=versao deb $2=glibc host $3=need
-    [ -n "$3" ] || return 0
+
+# Data legível da entrada que gate_cache_lookup acabou de ler.
+gate_cache_date() {
+    [ -n "$CACHE_AT" ] || { printf 'data desconhecida'; return 0; }
+    date -d "@$CACHE_AT" '+%d/%m/%Y %H:%M' 2>/dev/null || printf '%s' "$CACHE_AT"
+}
+
+# Um veredito "incompatível" em cache pode PULAR o download?
+#   • é do MESMO asset publicado agora (sha256 do cache = sha256 da API) → sim;
+#   • sem como conferir a identidade (API fora/sem digest) → só dentro do
+#     prazo GATE_CACHE_TTL;
+#   • entrada sem identidade (formato antigo) → nunca: reavalia uma vez.
+gate_cache_trusted() {  # $1=versao $2=glibc $3=sha256 publicado agora (vazio = desconhecido)
+    local age
+    gate_cache_lookup "$1" "$2" || return 1
+    [ -n "$CACHE_AT" ] || return 1
+    if [ -n "${3:-}" ] && [ -n "$CACHE_SHA" ] && [ "$CACHE_SHA" != none ]; then
+        [ "$3" = "$CACHE_SHA" ]
+        return
+    fi
+    age=$(( $(date +%s) - CACHE_AT ))
+    [ "$age" -ge 0 ] && [ "$age" -le "$GATE_CACHE_TTL" ]
+}
+
+# Grava/substitui a entrada (versao, glibc) — atômico e best-effort (o cache
+# nunca derruba o instalador). $4 = sha256 REAL do asset que foi avaliado.
+# Toda avaliação INVALIDA a entrada anterior da chave: veredito "sem
+# informação" (gate cego, NEED vazio) remove a linha e não grava outra —
+# nunca vira atalho, e um "incompatível" velho não sobrevive a um build bom.
+gate_cache_put() {  # $1=versao deb $2=glibc host $3=need $4=sha256 avaliado
+    [ -f "$GATE_CACHE" ] || [ -n "$3" ] || return 0
     grep -v "^$1|$2 -> " "$GATE_CACHE" 2>/dev/null > "$GATE_CACHE.tmp" || true
-    echo "$1|$2 -> $3" >> "$GATE_CACHE.tmp" 2>/dev/null || true
+    [ -z "$3" ] || echo "$1|$2 -> $3 sha256=${4:-none} at=$(date +%s)" >> "$GATE_CACHE.tmp" 2>/dev/null || true
     mv -f "$GATE_CACHE.tmp" "$GATE_CACHE" 2>/dev/null || true
 }
 
@@ -404,7 +472,7 @@ resolve_latest() {
 #          2 = reprovado no gate (cacheado); 1 = erro real (die no chamador).
 # ---------------------------------------------------------------------------
 fetch_candidate() {
-    local REAL_SIZE REAL_SHA NEED
+    local REAL_SIZE REAL_SHA EVAL_SHA NEED
     if [ -n "$DL_DIR" ]; then mkdir -p "$DL_DIR"; else DL_DIR="$(mktemp -d)"; DL_DIR_CREATED=1; fi
     DEB_FILE="$DL_DIR/$ASSET_NAME"
     info "Baixando $ASSET_URL ..."
@@ -433,8 +501,13 @@ fetch_candidate() {
     if [ "$REAL_SIZE" -lt "$MIN_SIZE_BYTES" ]; then
         die "Arquivo pequeno demais ($REAL_SIZE bytes) para ser o .deb do Pinokio. Abortando."
     fi
+    # v.261126a: IDENTIDADE do que foi avaliado = sha256 real do arquivo em
+    # mãos (mesmo no modo fallback, sem API) — é ele que diz, numa próxima
+    # execução, se o asset publicado ainda é o mesmo.
+    EVAL_SHA=$(sha256sum "$DEB_FILE" 2>/dev/null | awk '{print $1}') || EVAL_SHA=""
     if [ -n "$ASSET_SHA" ]; then
-        REAL_SHA=$(sha256sum "$DEB_FILE" | awk '{print $1}')
+        REAL_SHA="$EVAL_SHA"
+        [ -n "$REAL_SHA" ] || die "não foi possível calcular o sha256 do .deb. Abortando sem instalar."
         [ "$REAL_SHA" = "$ASSET_SHA" ] || die "sha256 NÃO confere ($REAL_SHA). Abortando sem instalar."
         ok "sha256 confere com o publicado pelo upstream."
     fi
@@ -450,7 +523,7 @@ fetch_candidate() {
 
     # ---- gate GLIBC (com cache) ----
     NEED=$(deb_glibc_max "$DEB_FILE")
-    gate_cache_put "${LATEST_TAG#v}" "$HOST_GLIBC" "$NEED"
+    gate_cache_put "${LATEST_TAG#v}" "$HOST_GLIBC" "$NEED" "$EVAL_SHA"
     if [ -n "$NEED" ] && ! glibc_ok "$NEED"; then
         warn "Candidato ${LATEST_TAG#v} exige GLIBC $NEED > host $HOST_GLIBC — REJEITADO pelo gate."
         rm -f "$DEB_FILE"
@@ -529,7 +602,7 @@ EOF
 # ---------------------------------------------------------------------------
 CAND_VER=""; DEB_FILE=""; SHA_UNVERIFIED=0
 select_candidate() {
-    local c try_need rc
+    local c rc
     for c in $CANDIDATES; do
         [ -z "$c" ] && continue
         # candidato == instalado e instalado são => nada a baixar
@@ -541,15 +614,21 @@ select_candidate() {
             SHA_UNVERIFIED=0
             return 0
         fi
-        # veredito em cache: candidato já conhecido como incompatível NESTE host?
-        try_need=$(gate_cache_get "$c" "$HOST_GLIBC")
-        if [ -n "$try_need" ] && ! glibc_ok "$try_need"; then
-            warn "Candidato $c: gate GLIBC em cache (exige $try_need > $HOST_GLIBC) — pulando download."
-            continue
-        fi
+        # v.261126a: resolve PRIMEIRO — o sha256 que o GitHub publica é a
+        # identidade do asset de HOJE. Só depois consulta o cache: um
+        # "incompatível" só pula o download se for veredito DESSE asset (ou
+        # se for recente, quando a API não deu identidade). Antes o cache era
+        # consultado antes da resolução e valia para sempre.
         if ! resolve_version "$c"; then
             warn "Candidato $c: não resolvido no GitHub — pulando."
             continue
+        fi
+        if gate_cache_lookup "$c" "$HOST_GLIBC" && [ -n "$CACHE_NEED" ] && ! glibc_ok "$CACHE_NEED"; then
+            if gate_cache_trusted "$c" "$HOST_GLIBC" "${ASSET_SHA:-}"; then
+                skip "Candidato $c: já recusado pelo gate (exige GLIBC $CACHE_NEED > $HOST_GLIBC; asset ${CACHE_SHA:0:12}, avaliado em $(gate_cache_date)) — pulando download."
+                continue
+            fi
+            info "Candidato $c: o cache do gate (exige GLIBC $CACHE_NEED) não identifica o asset publicado hoje — reavaliando."
         fi
         rc=0; fetch_candidate || rc=$?
         if [ "$rc" = 0 ]; then
@@ -647,6 +726,17 @@ if [ -n "$CURRENT_VER" ] && [ -n "$CAND_VER" ] \
     OP_LABEL="DOWNGRADE($ACTION)"
 fi
 
+# v.261126a: sha256 do asset da versão JÁ instalada — o que o gate deste
+# instalador registrou quando a avaliou (vazio se ele nunca a avaliou). É o
+# único sha honesto a gravar em SKIP/PINNED: antes o `state` saía com o sha
+# do candidato RECUSADO (sobrou em ASSET_SHA do resolve) rotulado como o
+# asset instalado.
+installed_asset_sha() {
+    gate_cache_lookup "$CURRENT_VER" "$HOST_GLIBC" || return 0
+    case "$CACHE_SHA" in ''|none) return 0 ;; esac
+    printf '%s' "$CACHE_SHA"
+}
+
 case "$ACTION" in
     SKIP)
         skip "Pinokio $CURRENT_VER já é a melhor versão compatível. Prosseguindo com a auditoria de saúde."
@@ -655,6 +745,7 @@ case "$ACTION" in
         if [ "$STAMP_TAG" != "v$CAND_VER" ]; then
             LATEST_TAG="v$CAND_VER"
             ASSET_NAME="$(asset_for_tag "$CAND_VER")"
+            ASSET_SHA="$(installed_asset_sha)"
             write_state "adopted"
             info "Instalação existente adotada pelo instalador (state gravado)."
         fi
@@ -663,6 +754,7 @@ case "$ACTION" in
         skip "Mantendo $CURRENT_VER (latest $LATEST_VER reprovada no gate GLIBC deste host)."
         LATEST_TAG="v$CAND_VER"
         ASSET_NAME="$(asset_for_tag "$CAND_VER")"
+        ASSET_SHA="$(installed_asset_sha)"
         write_state "pinned"
         warn "$DOWNGRADE_NOTE"
         ;;
@@ -752,7 +844,8 @@ install_pinokiocontrol() {
 # Overrides p/ sandbox/testes: PINOKIOCONTROL_STATE_DIR, PINOKIOCONTROL_OPT_DIR,
 # PINOKIOCONTROL_GITEA_RAW, PINOKIOCONTROL_INSTALL_SCRIPT_URL, PINOKIOCONTROL_DISPLAY,
 # PINOKIOCONTROL_SESSION_APPS_FILE, PINOKIOCONTROL_SKIP_GITHUB, PINOKIOCONTROL_SKIP_GITEA,
-# VNCCONTROL_STATE_DIR.
+# VNCCONTROL_STATE_DIR. PINOKIO_GATE_CACHE_TTL: prazo (s) de um veredito
+# "incompatível" em cache quando a API não informa o digest do asset.
 
 VERSION="__SCRIPT_VERSION__"
 
@@ -764,6 +857,13 @@ DISPLAY_VNC="${PINOKIOCONTROL_DISPLAY:-:99}"
 OPT_PINOKIO="${PINOKIOCONTROL_OPT_DIR:-/opt/Pinokio}"
 PINOKIO_HOME_CFG="$HOME/.pinokio/config.json"
 PTY_REL="resources/app.asar.unpacked/node_modules/@homebridge/node-pty-prebuilt-multiarch/build/Release/pty.node"
+# Gate do instalador (v.261126a): o cache de vereditos leva a IDENTIDADE do
+# asset avaliado — mesmo formato e mesmas regras do install.sh. Um
+# "incompatível" em cache só é levado a sério se for do asset publicado hoje.
+GATE_CACHE="$STATE_DIR/glibc-gate.cache"
+GATE_CACHE_TTL="${PINOKIO_GATE_CACHE_TTL:-86400}"
+case "$GATE_CACHE_TTL" in ''|*[!0-9]*) GATE_CACHE_TTL=86400 ;; esac
+case "$(uname -m)" in x86_64) DEB_ARCH=amd64 ;; aarch64|arm64) DEB_ARCH=arm64 ;; *) DEB_ARCH="" ;; esac
 
 say() { echo "[pinokiocontrol] $*"; }
 die() { echo "[pinokiocontrol ERRO] $*" >&2; exit 1; }
@@ -816,10 +916,68 @@ glibc_ok() {
     top=$(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -1)
     [ "$top" = "$have" ]
 }
-# Veredito do gate do instalador para uma versão (vazio = sem cache)
-latest_glibc_cached() {  # $1 = versão
-    [ -r "$STATE_DIR/glibc-gate.cache" ] || return 0
-    sed -n "s/^$1|$(host_glibc) -> //p" "$STATE_DIR/glibc-gate.cache" 2>/dev/null | tail -1
+# Cache do veredito do gate (formato: "versao|glibc -> NEED sha256=… at=…";
+# linha sem sha256/at = formato antigo). gate_cache_lookup preenche
+# CACHE_NEED / CACHE_SHA / CACHE_AT.
+gate_cache_lookup() {  # $1=versao $2=glibc → 0 = há entrada (1 = não há)
+    local line kv ver_re glibc_re
+    CACHE_NEED=""; CACHE_SHA=""; CACHE_AT=""
+    [ -r "$GATE_CACHE" ] || return 1
+    ver_re="${1//./\\.}"; glibc_re="${2//./\\.}"
+    line=$(sed -n "s/^$ver_re|$glibc_re -> //p" "$GATE_CACHE" 2>/dev/null | tail -1) || line=""
+    [ -n "$line" ] || return 1
+    CACHE_NEED="${line%%[[:space:]]*}"
+    for kv in ${line#"$CACHE_NEED"}; do
+        case "$kv" in
+            sha256=*) CACHE_SHA="${kv#sha256=}" ;;
+            at=*)     CACHE_AT="${kv#at=}" ;;
+        esac
+    done
+    case "$CACHE_AT" in *[!0-9]*) CACHE_AT="" ;; esac   # corrompida = sem data
+    return 0
+}
+gate_cache_date() {
+    [ -n "$CACHE_AT" ] || { printf 'data desconhecida'; return 0; }
+    date -d "@$CACHE_AT" '+%d/%m/%Y %H:%M' 2>/dev/null || printf '%s' "$CACHE_AT"
+}
+# O "incompatível" em cache pode ser levado a sério? Só se for do MESMO
+# asset publicado agora (sha256 da API), ou se for recente quando a API não
+# deu identidade. Linha do formato antigo (sem identidade): nunca — o
+# instalador reavalia. ($3 = sha256 publicado agora; vazio = desconhecido)
+gate_cache_trusted() {  # $1=versao $2=glibc $3=sha256 publicado
+    local age
+    gate_cache_lookup "$1" "$2" || return 1
+    [ -n "$CACHE_AT" ] || return 1
+    if [ -n "${3:-}" ] && [ -n "$CACHE_SHA" ] && [ "$CACHE_SHA" != none ]; then
+        [ "$3" = "$CACHE_SHA" ]
+        return
+    fi
+    age=$(( $(date +%s) - CACHE_AT ))
+    [ "$age" -ge 0 ] && [ "$age" -le "$GATE_CACHE_TTL" ]
+}
+# Latest no GitHub → GH_TAG (versão sem 'v') e GH_SHA (sha256 do .deb da nossa
+# arquitetura = IDENTIDADE do asset publicado; vazio se a API não informar).
+# Mesma extração do instalador: JSON colapsado numa linha e lido com sed
+# (consome tudo — sem `head`, sem SIGPIPE intermitente).
+gh_latest() {
+    GH_TAG=""; GH_SHA=""
+    local json joined url
+    json=$(curl -m 8 -fsSL -H 'Accept: application/vnd.github+json' \
+          -H 'User-Agent: pinokiocontrol/1.0' \
+          https://api.github.com/repos/pinokiocomputer/pinokio/releases/latest 2>/dev/null) || return 1
+    joined=$(printf '%s' "$json" | tr -d '\n\r')
+    GH_TAG=$(printf '%s' "$joined" | grep -oE '"tag_name": *"[^"]*"' \
+             | sed -n -e 's/.*"tag_name": *"v\?//' -e 's/"$//' -e '1p')
+    [ -n "$GH_TAG" ] || return 1
+    [ -n "$DEB_ARCH" ] || return 0
+    url=$(printf '%s' "$joined" | grep -oE '"browser_download_url": *"[^"]*"' \
+          | sed -e 's/.*"browser_download_url": *"//' -e 's/"$//' \
+          | grep -E "/Pinokio_${GH_TAG//./\\.}_${DEB_ARCH}\\.deb\$" | tail -1) || url=""
+    [ -n "$url" ] || return 0
+    GH_SHA=$(printf '%s' "$joined" \
+             | grep -oE "\"digest\": *\"sha256:[0-9a-f]+\"[^{}]*\"browser_download_url\": *\"$url\"" \
+             | sed -n 's/.*"digest": *"sha256:\([0-9a-f]*\)".*/\1/p') || GH_SHA=""
+    return 0
 }
 runtime_glibc_ok() {
     local f="$OPT_PINOKIO/$PTY_REL" need
@@ -850,17 +1008,23 @@ cmd_status() {
     if [ "${PINOKIOCONTROL_SKIP_GITHUB:-0}" = 1 ]; then
         echo "pinokio-github: (skip por override)"
     else
-        local tag need_g
-        tag=$(curl -m 8 -fsSL -H 'Accept: application/vnd.github+json' \
-              -H 'User-Agent: pinokiocontrol/1.0' \
-              https://api.github.com/repos/pinokiocomputer/pinokio/releases/latest 2>/dev/null \
-              | grep -oE '"tag_name": *"[^"]*"' | head -1 | sed -e 's/.*"tag_name": *"v\?//' -e 's/"$//')
-        if [ -n "$tag" ]; then
-            need_g=$(latest_glibc_cached "$tag")
-            if [ -n "$need_g" ] && ! glibc_ok "$need_g"; then
-                echo "pinokio-github: $tag (latest INCOMPATÍVEL com este host — gate GLIBC mantém a ${inst:-versão instalada})"
-            elif [ "$tag" = "$inst" ]; then echo "pinokio-github: $tag (atual)"
-            else echo "pinokio-github: $tag (NOVA — --update aplica via instalador c/ gate GLIBC)"; fi
+        # v.261126a: o "INCOMPATÍVEL" do cache só vale para o asset que o gate
+        # avaliou. Cache sem identidade (formato antigo) ou de outro asset é
+        # denunciado — antes ele valia para sempre, mesmo depois de o upstream
+        # substituir o .deb da mesma tag.
+        if gh_latest; then
+            if [ "$GH_TAG" = "$inst" ] && runtime_glibc_ok; then
+                # a latest já é a instalada e ela RODA neste host: é "atual",
+                # faça o que fizer o cache (chave velha, digest trocado...)
+                echo "pinokio-github: $GH_TAG (atual)"
+            elif gate_cache_lookup "$GH_TAG" "$(host_glibc)" && [ -n "$CACHE_NEED" ] && ! glibc_ok "$CACHE_NEED"; then
+                if gate_cache_trusted "$GH_TAG" "$(host_glibc)" "$GH_SHA"; then
+                    echo "pinokio-github: $GH_TAG (latest INCOMPATÍVEL com este host — gate GLIBC mantém a ${inst:-versão instalada}; avaliado em $(gate_cache_date), asset ${CACHE_SHA:0:12})"
+                else
+                    echo "pinokio-github: $GH_TAG (cache do gate ANTIGO: não identifica o asset publicado hoje — --update reavalia antes de decidir)"
+                fi
+            elif [ "$GH_TAG" = "$inst" ]; then echo "pinokio-github: $GH_TAG (atual)"
+            else echo "pinokio-github: $GH_TAG (NOVA — --update aplica via instalador c/ gate GLIBC)"; fi
         else
             echo "pinokio-github: inacessível (rede?)"
         fi
@@ -1033,7 +1197,7 @@ cmd_persistent() {  # $1 = ON|OFF
 
 cmd_update() {
     [ "$(id -u)" -eq 0 ] || die "rode como root (sudo)"
-    local lv tag inst need=0 why="" unverified=0 need_g
+    local lv tag inst need=0 why="" unverified=0 pub_sha="" gate_note=""
     # v.261121e (R2): honrar PINOKIOCONTROL_SKIP_GITEA também no update
     if [ "${PINOKIOCONTROL_SKIP_GITEA:-0}" != 1 ]; then
         lv=$(curl -m 8 -fsSL "$GITEA_RAW/VERSION" 2>/dev/null || true)
@@ -1042,15 +1206,21 @@ cmd_update() {
     fi
     if [ "${PINOKIOCONTROL_SKIP_GITHUB:-0}" != 1 ]; then
         inst=$(dpkg-query -W -f='${Version}' pinokio 2>/dev/null || true)
-        tag=$(curl -m 8 -fsSL -H 'Accept: application/vnd.github+json' \
-              -H 'User-Agent: pinokiocontrol/1.0' \
-              https://api.github.com/repos/pinokiocomputer/pinokio/releases/latest 2>/dev/null \
-              | grep -oE '"tag_name": *"[^"]*"' | head -1 | sed -e 's/.*"tag_name": *"v\?//' -e 's/"$//')
-        [ -z "$tag" ] && unverified=1
+        tag=""; pub_sha=""
+        # v.261126a: a MESMA consulta traz o digest do .deb publicado — a
+        # identidade do asset. Só se levanta a sério um "incompatível" do
+        # cache se ele for DESSE asset (gate_cache_trusted); cache do formato
+        # antigo ou de outro asset manda reavaliar. Antes o atalho respondia
+        # "já atualizado" (rc=0) para sempre, com a latest nunca reavaliada.
+        if gh_latest; then tag="$GH_TAG"; pub_sha="$GH_SHA"; else unverified=1; fi
         if [ -n "$tag" ] && [ "$tag" != "$inst" ]; then
-            need_g=$(latest_glibc_cached "$tag")
-            if [ -n "$need_g" ] && ! glibc_ok "$need_g"; then
-                :  # latest conhecida do gate como incompatível — nada a fazer
+            gate_cache_lookup "$tag" "$(host_glibc)"
+            if [ -n "$CACHE_NEED" ] && ! glibc_ok "$CACHE_NEED"; then
+                if gate_cache_trusted "$tag" "$(host_glibc)" "$pub_sha"; then
+                    gate_note="latest $tag recusada pelo gate (exige GLIBC $CACHE_NEED > $(host_glibc); avaliado em $(gate_cache_date), asset ${CACHE_SHA:0:12}) — nada a fazer"
+                else
+                    need=1; why="${why:+$why; }pinokio ${inst:-nenhum}->$tag (cache do gate não identifica o asset publicado — reavaliando)"
+                fi
             else
                 need=1; why="${why:+$why; }pinokio ${inst:-nenhum}->$tag (sujeito ao gate GLIBC)"
             fi
@@ -1093,6 +1263,9 @@ cmd_update() {
         return 1
     fi
     say "já atualizado (verificado agora: script $VERSION · pinokio $(dpkg-query -W -f='${Version}' pinokio 2>/dev/null || echo NENHUM))"
+    # v.261126a: quando a latest fica para trás por decisão do gate, dizer
+    # qual veredito é esse e de quando — "já atualizado" sozinho mentia.
+    [ -z "$gate_note" ] || say "$gate_note"
     return 0
 }
 
@@ -1319,6 +1492,73 @@ vnc_area_up() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# REINÍCIO após troca de arquivos (v.261126a). UPGRADE/REPAIR/REINSTALL
+# trocam os binários EM DISCO; o processo antigo seguia rodando o build
+# antigo pelos inodes antigos — e passava a ler recursos novos do disco —
+# até alguém reiniciar, com o veredito dizendo "UPGRADE concluído". Agora:
+# se o app estava em execução, ele volta NOVO no fim da instalação.
+# Só conta como "em execução" um pinokio-bin cujo executável vive no NOSSO
+# APP_DIR; um pinokio-bin de outro diretório não é nosso e não é tocado.
+# ---------------------------------------------------------------------------
+managed_app_pids() {  # → MANAGED_PIDS (vazio = nenhum); rc=1 se houver pid ALHEIO
+    local p exe foreign=0
+    MANAGED_PIDS=""
+    for p in $(pgrep -f '[p]inokio-bin' 2>/dev/null); do
+        [ -d "/proc/$p" ] || continue           # morreu entre o pgrep e o readlink
+        exe=$(readlink "/proc/$p/exe" 2>/dev/null) || exe=""
+        case "${exe%/*}" in
+            "$APP_DIR") MANAGED_PIDS="$MANAGED_PIDS$p " ;;
+            *) foreign=1 ;;
+        esac
+    done
+    return "$foreign"
+}
+restart_app_after_swap() {
+    RESTART_STATUS="sem-troca"
+    case "${ACTION:-}" in UPGRADE|REPAIR|REINSTALL) ;; *) return 0 ;; esac
+    if [ "$SKIP_AUTOSTART" = "1" ]; then
+        RESTART_STATUS="pulado"
+        info "PINOKIO_SKIP_AUTOSTART=1 — um Pinokio em execução NÃO é reiniciado por este instalador (rode: pinokiocontrol --restart)."
+        return 0
+    fi
+    if ! managed_app_pids; then
+        warn "há 'pinokio-bin' em execução FORA de $APP_DIR — não é nosso e não foi tocado. Para valer a versão instalada, reinicie com: pinokiocontrol --restart"
+        RESTART_STATUS="pulado-externo"
+        return 0
+    fi
+    if [ -z "$MANAGED_PIDS" ]; then RESTART_STATUS="não-rodava"; return 0; fi
+    if [ ! -x "$PC_BIN_DIR/pinokiocontrol" ]; then
+        warn "o Pinokio antigo (pids $MANAGED_PIDS) segue em execução: pinokiocontrol não foi instalado — reinicie manualmente."
+        RESTART_STATUS="falhou"
+        return 1
+    fi
+    if ! vnc_area_up; then
+        warn "o Pinokio antigo (pids $MANAGED_PIDS) segue em execução: a área VNC ($VNC_DISPLAY) está desligada e não há como relançá-lo. Suba a área e rode: pinokiocontrol --restart"
+        RESTART_STATUS="falhou"
+        return 1
+    fi
+    info "Reiniciando o Pinokio (pids ${MANAGED_PIDS% }) para valer a versão instalada ($(installed_version))..."
+    # 9>&- / 8>&-: nenhum lock nosso (nem o herdado do --update) vaza para o
+    # pinokiocontrol, para o vnccontrol nem para os ring-consumers eternos.
+    # O ambiente repassa as rotas DESTA execução: em sandbox o reinício segue
+    # hermético (lock, marker, lista e /opt daqui — nunca os reais).
+    if env PINOKIOCONTROL_STATE_DIR="$STATE_DIR" \
+            PINOKIOCONTROL_OPT_DIR="$APP_DIR" \
+            PINOKIOCONTROL_SESSION_APPS_FILE="$SESSION_APPS_FILE" \
+            "$PC_BIN_DIR/pinokiocontrol" --restart 9>&- 8>&-; then
+        healed "Pinokio reiniciado na versão instalada ($(installed_version))."
+        RESTART_STATUS="reiniciado"
+    else
+        warn "pinokiocontrol --restart retornou erro — o Pinokio pode estar fora do ar (veja as linhas [pinokiocontrol] acima)."
+        RESTART_STATUS="falhou"
+        return 1
+    fi
+    return 0
+}
+RESTART_STATUS="sem-troca"
+restart_app_after_swap || true
+
 persist_autostart() {
     local vncbin listed
     vncbin="$(vnccontrol_bin)"
@@ -1419,12 +1659,27 @@ app_bin_ok                || FAIL="${FAIL:+$FAIL; }binário $APP_BIN ausente/nã
 installed_glibc_ok        || FAIL="${FAIL:+$FAIL; }pty.node incompatível com o GLIBC do host ($HOST_GLIBC)"
 [ -x "$PC_BIN_DIR/pinokiocontrol" ] || FAIL="${FAIL:+$FAIL; }pinokiocontrol não instalado"
 [ "$PERSIST_STATUS" != "falhou" ]  || FAIL="${FAIL:+$FAIL; }persistência/autostart falhou"
+[ "$RESTART_STATUS" != "falhou" ]  || FAIL="${FAIL:+$FAIL; }Pinokio não voltou após a troca de arquivos (suba com: pinokiocontrol --start; para voltar a versão anterior: PINOKIO_INSTALLER_VERSION=${CURRENT_VER:-<versão>} + este instalador)"
 [ "$SHA_UNVERIFIED" = 0 ]          || FAIL="${FAIL:+$FAIL; }sha256 do asset NÃO verificado (modo fallback sem API)"
 grep -q "^VERSION=$CAND_VER$" "$STATE_FILE" 2>/dev/null \
                           || FAIL="${FAIL:+$FAIL; }state não registra a versão instalada"
 
 # SearXNG na 8888 ( informativo — rede padrão; NUNCA reconfiguramos portas)
-SEARX_8888=$(curl -m 5 -sS -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8888/search?q=x&format=json' 2>/dev/null || echo 000)
+searx_code() {
+    local c
+    c=$(curl -m 5 -sS -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8888/search?q=x&format=json' 2>/dev/null) || c="000"
+    printf '%s' "${c:-000}"
+}
+SEARX_8888="$(searx_code)"
+if [ "$SEARX_8888" != 200 ] && [ "$RESTART_STATUS" = "reiniciado" ]; then
+    # v.261126a: o app ACABOU de subir e o Home Server (SearXNG) leva alguns
+    # segundos — julgar a :8888 na hora era corrida (aviso falso). Até 90s.
+    for _ in $(seq 1 30); do
+        sleep 3
+        SEARX_8888="$(searx_code)"
+        if [ "$SEARX_8888" = 200 ]; then break; fi
+    done
+fi
 if [ "$SEARX_8888" = 200 ]; then
     info "SearXNG responde em :8888 (padrão da rede) — http 200"
 elif pgrep -f '[p]inokio-bin' >/dev/null 2>&1; then
@@ -1438,6 +1693,7 @@ echo " Controle local   : $PC_LINK (pinokiocontrol $SCRIPT_VERSION)"
 echo " Desktop/Ícone    : $DESKTOP_FILE + hicolor/$ICON_NAME"
 echo " Saúde            : $( [ -z "$HEALED_ITEMS" ] && echo 'nenhum reparo necessário' || echo "reparado: $HEALED_ITEMS" )"
 echo " Persistência     : $PERSIST_STATUS (session-apps do vnccontrol: $SESSION_APPS_FILE)"
+echo " Reinício         : $RESTART_STATUS (após UPGRADE/REPAIR/REINSTALL, se o app estava no ar)"
 [ -n "$WARN_ITEMS" ] && echo " Avisos           : $WARN_ITEMS"
 echo "--------------------------------------------------------------"
 if [ -z "$FAIL" ]; then
